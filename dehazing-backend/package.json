@@ -1,0 +1,29 @@
+{
+  "name": "dehazing-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "latest",
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "express-rate-limit": "^8.2.1",
+    "gridfs-stream": "^1.1.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "latest",
+    "mongodb": "^7.0.0",
+    "mongoose": "latest",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.12",
+    "socket.io": "latest",
+    "uuid": "latest",
+    "ws": "latest"
+  },
+  "devDependencies": {
+    "nodemon": "latest"
+  }
+}
