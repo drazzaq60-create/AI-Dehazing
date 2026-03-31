@@ -11,12 +11,13 @@
       "backgroundColor": "#0f172a"
     },
     "ios": {
-      "bundleIdentifier": "com.yourname.dehazingapp",
+      "bundleIdentifier": "com.ahad.dehazingapp",
       "supportsTablet": true,
       "infoPlist": {
         "NSCameraUsageDescription": "AI Dehazing app needs camera access to capture video frames for processing.",
         "NSMicrophoneUsageDescription": "Required for video recording with audio.",
-        "NSPhotoLibraryUsageDescription": "Access to photo library to select videos for dehazing."
+        "NSPhotoLibraryUsageDescription": "Access to photo library to select videos for dehazing.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -28,9 +29,11 @@
         "RECORD_AUDIO",
         "READ_EXTERNAL_STORAGE",
         "WRITE_EXTERNAL_STORAGE",
-        "INTERNET"
+        "INTERNET",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
       ],
-      "package": "com.yourname.dehazingapp"
+      "package": "com.ahad.dehazingapp"
     },
     "web": {
       "bundler": "metro"
@@ -48,6 +51,12 @@
     ],
     "experiments": {
       "typedRoutes": false
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "8ef09baa-e725-4f61-bc5d-d59d0b9c83ae"
+      }
     }
   }
 }

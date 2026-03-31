@@ -1,4 +1,5 @@
 // processing.js - Real-time Dehazing with Side-by-Side Display
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -12,6 +13,7 @@ import {
   TouchableOpacity,
   View
 } from 'react-native';
+import { Camera, useCameraDevice, useCameraFormat, useCameraPermission } from 'react-native-vision-camera';
 import { useAppContext } from './_layout';
 
 const { width } = Dimensions.get('window');
@@ -25,72 +27,115 @@ export default function ProcessingScreen() {
   const [mode, setMode] = useState('cloud');
   const [hazyFrame, setHazyFrame] = useState(null);
   const [dehazedFrame, setDehazedFrame] = useState(null);
-  const [frameCount, setFrameCount] = useState(0);
-  const [fps, setFps] = useState(0);
-  const [delay, setDelay] = useState(0);
+  const [sessionStats, setSessionStats] = useState({ frameCount: 0, fps: 0, delay: 0 });
   const [sessionId, setSessionId] = useState(null);
   const [status, setStatus] = useState('Ready');
-  const [savedFrames, setSavedFrames] = useState([]);
+  const [videoUrl, setVideoUrl] = useState(null);
 
+  const sessionIdRef = useRef(null);
+  const wasStopClickedRef = useRef(false);
+  const lastRenderRef = useRef(0);
   const startTimeRef = useRef(null);
   const pendingBinaryMetaRef = useRef(null);
-  const waitingForHazyRef = useRef(false);
+
+  // Sync mode changes to server during active processing
+  useEffect(() => {
+    if (isProcessing && sessionIdRef.current) {
+      console.log('🔄 Requesting mode switch to:', mode);
+      wsService.send({
+        type: 'switch_mode',
+        sessionId: sessionIdRef.current,
+        mode: mode
+      });
+    }
+  }, [mode]);
+
+  // Vision Camera refs & hooks
+  const { hasPermission, requestPermission } = useCameraPermission();
+  const currentDevice = useCameraDevice('back');
+  const cameraRef = useRef(null);
+  const isRecordingRef = useRef(false);
+  const captureTimerRef = useRef(null);
+  const frameCountRef = useRef(0);
+  const lastFrameTimeRef = useRef(0);
+
+  const format = useCameraFormat(currentDevice, [
+    { videoResolution: { width: 320, height: 240 } },
+    { photoResolution: { width: 320, height: 240 } },
+    { fps: 60 }
+  ]);
+
+  useEffect(() => {
+    if (!hasPermission) requestPermission();
+  }, [hasPermission]);
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      isRecordingRef.current = false;
+      if (captureTimerRef.current) clearTimeout(captureTimerRef.current);
+    };
+  }, []);
 
   // Listen for processed frames from backend
   useEffect(() => {
     if (!wsService) return;
 
+    // Optimized frame handler for high-FPS display
     const handleMessage = (data) => {
-      console.log('Received:', data.type);
+      // console.log('Received:', data.type);
 
       switch (data.type) {
-        case 'session_created':
-          setSessionId(data.sessionId);
-          setIsProcessing(true);
-          setStatus('Processing started');
-          startTimeRef.current = Date.now();
-          break;
-
         case 'processed_frame':
-          // Check if this is binary mode
-          if (data.isBinary) {
-            pendingBinaryMetaRef.current = data;
-            waitingForHazyRef.current = true;
-          } else {
-            // Legacy base64 mode
-            if (data.originalFrame) {
-              setHazyFrame(`data:image/jpeg;base64,${data.originalFrame}`);
-            }
-            if (data.processedFrame) {
-              setDehazedFrame(`data:image/jpeg;base64,${data.processedFrame}`);
-            }
+          // 1. If we just clicked Stop, ignore residual frames from the network
+          if (wasStopClickedRef.current) return;
+
+          // 2. Auto-sync sessionId if we're monitoring a session
+          if (data.sessionId && !sessionIdRef.current) {
+            sessionIdRef.current = data.sessionId;
+            setSessionId(data.sessionId);
           }
 
-          setFrameCount(data.frameCount || 0);
-          setFps(data.fps || 0);
-          setDelay(data.processingTime || 0);
-          setStatus(`Processing: ${data.frameCount} frames @ ${data.fps} FPS`);
+          // 3. Throttle UI rendering to keep UI responsive at 15-20 FPS
+          const now = Date.now();
+          if (now - lastRenderRef.current < 50) return;
+          lastRenderRef.current = now;
+
+          if (data.originalFrame) setHazyFrame(data.originalFrame);
+          if (data.originalFrame) setHazyFrame(data.originalFrame);
+          if (data.processedFrame) setDehazedFrame(data.processedFrame);
+
+          setSessionStats({
+            frameCount: data.frameCount || 0,
+            fps: data.fps || 0,
+            delay: data.processingTime || 0
+          });
+
+          if (!isProcessing) setIsProcessing(true);
+          const newStatus = 'Processing Live...';
+          if (status !== newStatus) setStatus(newStatus);
+          break;
+
+        case 'session_created':
+          setSessionId(data.sessionId);
+          sessionIdRef.current = data.sessionId;
+          setIsProcessing(true);
+          setStatus('Processing started. Capturing...');
+
+          // Start capture loop ONLY after session is verified by backend
+          isRecordingRef.current = true;
+          frameCountRef.current = 0;
+          startLiveCapture();
+          break;
+
+        case 'video_ready':
+          setStatus('Video ready for download!');
+          setVideoUrl(data.downloadUrl);
           break;
 
         case 'processing_complete':
           setIsProcessing(false);
-          setStatus(`Done: ${data.totalFrames} frames processed`);
-          Alert.alert(
-            'Processing Complete',
-            `Processed ${data.totalFrames} frames\nAverage FPS: ${data.avgFps}`,
-            [{ text: 'OK' }]
-          );
-          break;
-
-        case 'video_ready':
-          Alert.alert(
-            'Video Ready',
-            `${data.frameCount} frames available`,
-            [
-              { text: 'Save Locally', onPress: () => saveVideoLocally() },
-              { text: 'Later', style: 'cancel' }
-            ]
-          );
+          setStatus('Finished');
           break;
 
         case 'error':
@@ -99,31 +144,10 @@ export default function ProcessingScreen() {
       }
     };
 
-    // Handle binary messages (frames from server)
-    const handleBinaryMessage = (arrayBuffer) => {
-      if (!pendingBinaryMetaRef.current) return;
-
-      // Convert ArrayBuffer to blob URL for display
-      const blob = new Blob([arrayBuffer], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
-
-      if (waitingForHazyRef.current) {
-        // This is the hazy frame
-        setHazyFrame(url);
-        waitingForHazyRef.current = false;
-      } else {
-        // This is the dehazed frame
-        setDehazedFrame(url);
-        pendingBinaryMetaRef.current = null;
-      }
-    };
-
     wsService.on('message', handleMessage);
-    wsService.on('binaryMessage', handleBinaryMessage);
 
     return () => {
       wsService.off('message', handleMessage);
-      wsService.off('binaryMessage', handleBinaryMessage);
     };
   }, [wsService]);
 
@@ -136,9 +160,10 @@ export default function ProcessingScreen() {
 
     const newSessionId = `process_${Date.now()}`;
     setSessionId(newSessionId);
-    setFrameCount(0);
-    setFps(0);
-    setSavedFrames([]);
+    sessionIdRef.current = newSessionId;
+    wasStopClickedRef.current = false; // Allow frames again
+
+    setSessionStats({ frameCount: 0, fps: 0, delay: 0 });
     setHazyFrame(null);
     setDehazedFrame(null);
 
@@ -149,19 +174,65 @@ export default function ProcessingScreen() {
       sessionId: newSessionId
     });
 
-    setIsProcessing(true);
-    setStatus('Waiting for frames...');
+    setStatus('Initializing session...');
+    setVideoUrl(null); // Reset previous video link
   };
 
+  // Dedicated capture loop for the Processing screen
+  const startLiveCapture = () => {
+    const captureLoop = async () => {
+      if (!isRecordingRef.current || !cameraRef.current) return;
+
+      try {
+        const photo = await cameraRef.current.takeSnapshot({ quality: 50 });
+        const now = Date.now();
+        frameCountRef.current++;
+        const currentCount = frameCountRef.current;
+
+        // Process and send in background
+        (async () => {
+          try {
+            const manipulated = await manipulateAsync(
+              photo.path.startsWith('file') ? photo.path : `file://${photo.path}`,
+              [],
+              { compress: 0.5, format: SaveFormat.JPEG, base64: true }
+            );
+
+            wsService.send({
+              type: 'video_frame',
+              frame: manipulated.base64,
+              frameNumber: currentCount,
+              sessionId: sessionIdRef.current,
+              userId: user?.id || 'anonymous',
+              timestamp: now
+            });
+          } catch (e) { }
+        })();
+
+        captureTimerRef.current = setTimeout(captureLoop, 50); // Target 20 FPS
+      } catch (err) {
+        captureTimerRef.current = setTimeout(captureLoop, 200);
+      }
+    };
+
+    captureLoop();
+  };
   // Stop processing
   const stopProcessing = () => {
-    if (sessionId) {
+    const targetSession = sessionIdRef.current || sessionId;
+    if (targetSession) {
       wsService.send({
         type: 'stop_processing',
-        sessionId: sessionId
+        sessionId: targetSession
       });
     }
+
+    wasStopClickedRef.current = true; // Block incoming residual frames
+    isRecordingRef.current = false;
+    if (captureTimerRef.current) clearTimeout(captureTimerRef.current);
     setIsProcessing(false);
+    setSessionId(null);
+    sessionIdRef.current = null;
     setStatus('Stopped');
   };
 
@@ -169,62 +240,87 @@ export default function ProcessingScreen() {
   const switchMode = () => {
     const newMode = mode === 'cloud' ? 'local' : 'cloud';
     setMode(newMode);
-
-    if (isProcessing && sessionId) {
-      wsService.send({
-        type: 'switch_mode',
-        sessionId: sessionId,
-        mode: newMode
-      });
-    }
+    // mode sync happens in useEffect
   };
 
-  // Save video locally (frames as images)
-  const saveVideoLocally = async () => {
-    if (savedFrames.length === 0) {
-      Alert.alert('No Frames', 'No frames to save');
+  // Save collected frames to phone gallery
+  // Capture the current dehazed frame to phone gallery
+  const captureSnapshot = async () => {
+    if (!dehazedFrame) {
+      Alert.alert('No image', 'Please start processing to capture a frame');
       return;
     }
 
     try {
-      if (Platform.OS === 'web') {
-        // Web: Create downloadable HTML gallery
-        const htmlContent = `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Dehazed Video - ${savedFrames.length} frames</title>
-  <style>
-    body { background: #0f172a; color: white; padding: 20px; font-family: Arial; }
-    h1 { color: #3b82f6; }
-    .grid { display: flex; flex-wrap: wrap; gap: 10px; }
-    img { width: 200px; border: 2px solid #3b82f6; border-radius: 8px; }
-  </style>
-</head>
-<body>
-  <h1>Dehazed Video Frames</h1>
-  <p>${savedFrames.length} frames | ${new Date().toLocaleString()}</p>
-  <div class="grid">
-    ${savedFrames.map((f, i) => `<img src="data:image/jpeg;base64,${f}" alt="Frame ${i + 1}">`).join('')}
-  </div>
-</body>
-</html>`;
+      const MediaLibrary = require('expo-media-library');
+      const FileSystem = require('expo-file-system');
 
-        const blob = new Blob([htmlContent], { type: 'text/html' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `dehazed_${Date.now()}.html`;
-        a.click();
-
-        Alert.alert('Saved', `${savedFrames.length} frames saved as HTML gallery`);
-      } else {
-        // Mobile: Use expo-file-system
-        Alert.alert('Saved', `${savedFrames.length} frames saved locally`);
+      const { status: pStatus } = await MediaLibrary.requestPermissionsAsync();
+      if (pStatus !== 'granted') {
+        Alert.alert('Permission needed', 'Allow storage access to save images');
+        return;
       }
+
+      setStatus('Saving snapshot...');
+
+      const base64 = dehazedFrame.replace(/^data:image\/[a-z]+;base64,/, '');
+      const filename = `${FileSystem.cacheDirectory}snapshot_${Date.now()}.jpg`;
+
+      await FileSystem.writeAsStringAsync(filename, base64, {
+        encoding: FileSystem.EncodingType ? FileSystem.EncodingType.Base64 : 'base64',
+      });
+
+      await MediaLibrary.saveToLibraryAsync(filename);
+
+      Alert.alert('Success', 'Snapshot saved to your photo gallery!');
+      setStatus('Snapshot saved');
     } catch (error) {
-      console.error('Save error:', error);
-      Alert.alert('Error', 'Failed to save video');
+      console.error('Capture error:', error);
+      Alert.alert('Error', 'Failed to save snapshot');
+      setStatus('Error saving');
+    }
+  };
+
+  // Download compiled MP4 from server
+  const downloadVideo = async () => {
+    if (!videoUrl) return;
+
+    try {
+      setStatus('Downloading video...');
+
+      const API_URL = wsService.ws.url.replace('ws://', 'http://').replace('wss://', 'https://');
+      const downloadLink = `${API_URL}${videoUrl}`;
+
+      console.log('🔗 Downloading from:', downloadLink);
+
+      if (Platform.OS === 'web') {
+        window.open(downloadLink, '_blank');
+      } else {
+        // Mobile download logic using expo-file-system
+        const FileSystem = require('expo-file-system');
+        const MediaLibrary = require('expo-media-library');
+
+        const { status } = await MediaLibrary.requestPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('Permission needed', 'Allow storage access to save video');
+          return;
+        }
+
+        const fileUri = `${FileSystem.cacheDirectory}dehazed_${sessionIdRef.current || 'video'}.mp4`;
+        const downloadRes = await FileSystem.downloadAsync(downloadLink, fileUri);
+
+        if (downloadRes.status === 200) {
+          await MediaLibrary.saveToLibraryAsync(downloadRes.uri);
+          Alert.alert('Success', 'Video saved to gallery!');
+        } else {
+          Alert.alert('Error', 'Download failed from server');
+        }
+      }
+      setStatus('Download complete');
+    } catch (error) {
+      console.error('Download error:', error);
+      Alert.alert('Error', 'Failed to download video');
+      setStatus('Error downloading');
     }
   };
 
@@ -247,13 +343,13 @@ export default function ProcessingScreen() {
       <View style={styles.modeSelector}>
         <TouchableOpacity
           style={[styles.modeButton, mode === 'cloud' && styles.modeActive]}
-          onPress={() => !isProcessing && setMode('cloud')}
+          onPress={() => setMode('cloud')}
         >
           <Text style={styles.modeText}>☁️ Cloud (Fast)</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.modeButton, mode === 'local' && styles.modeActive]}
-          onPress={() => !isProcessing && setMode('local')}
+          onPress={() => setMode('local')}
         >
           <Text style={styles.modeText}>💻 Local (Quality)</Text>
         </TouchableOpacity>
@@ -265,10 +361,20 @@ export default function ProcessingScreen() {
         <View style={styles.frameBox}>
           <Text style={styles.frameLabel}>Hazy Input</Text>
           <View style={styles.frameView}>
-            {hazyFrame ? (
+            {isProcessing && isRecordingRef.current && currentDevice ? (
+              <Camera
+                ref={cameraRef}
+                style={styles.frameImage}
+                device={currentDevice}
+                format={format}
+                isActive={true}
+                photo={true}
+                video={true}
+              />
+            ) : hazyFrame ? (
               <Image source={{ uri: hazyFrame }} style={styles.frameImage} resizeMode="cover" />
             ) : (
-              <Text style={styles.placeholderText}>No frames yet</Text>
+              <Text style={styles.placeholderText}>No input yet</Text>
             )}
           </View>
         </View>
@@ -280,7 +386,9 @@ export default function ProcessingScreen() {
             {dehazedFrame ? (
               <Image source={{ uri: dehazedFrame }} style={styles.frameImage} resizeMode="cover" />
             ) : (
-              <Text style={styles.placeholderText}>Start capture to see output</Text>
+              <Text style={styles.placeholderText}>
+                {isProcessing ? 'Processing...' : 'Start to see output'}
+              </Text>
             )}
           </View>
         </View>
@@ -292,23 +400,19 @@ export default function ProcessingScreen() {
         <View style={styles.statsGrid}>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Frames</Text>
-            <Text style={styles.statValue}>{frameCount}</Text>
+            <Text style={styles.statValue}>{sessionStats.frameCount}</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>FPS</Text>
-            <Text style={styles.statValue}>{fps}</Text>
+            <Text style={styles.statValue}>{sessionStats.fps}</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Delay</Text>
-            <Text style={styles.statValue}>{delay}ms</Text>
+            <Text style={styles.statValue}>{sessionStats.delay}ms</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Mode</Text>
             <Text style={styles.statValue}>{mode === 'cloud' ? '☁️' : '💻'}</Text>
-          </View>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Saved</Text>
-            <Text style={styles.statValue}>{savedFrames.length}</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Status</Text>
@@ -342,14 +446,21 @@ export default function ProcessingScreen() {
           </TouchableOpacity>
         )}
 
+        {videoUrl && (
+          <TouchableOpacity
+            style={[styles.primaryButton, { backgroundColor: '#3b82f6', marginTop: 10 }]}
+            onPress={downloadVideo}
+          >
+            <Text style={styles.buttonText}>⬇️ Download Dehazed MP4</Text>
+          </TouchableOpacity>
+        )}
+
         <TouchableOpacity
           style={styles.saveButton}
-          onPress={saveVideoLocally}
-          disabled={savedFrames.length === 0}
+          onPress={captureSnapshot}
+          disabled={!dehazedFrame}
         >
-          <Text style={styles.buttonText}>
-            💾 Save Video Locally ({savedFrames.length} frames)
-          </Text>
+          <Text style={styles.buttonText}>📸 Capture Snapshot to Gallery</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
@@ -362,7 +473,6 @@ export default function ProcessingScreen() {
     </ScrollView>
   );
 }
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,

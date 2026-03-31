@@ -41,3 +41,17 @@ app-example
 # generated native folders
 /ios
 /android
+
+# AI Model Files (Keep them if needed for collaboration, or ignore if too large)
+# scripts/real_dehaze/dehazeformer_real_haze_best
+# *.zip
+
+# Backend extras
+dehazing-backend/node_modules/
+dehazing-backend/temp/
+dehazing-backend/images/
+
+# Sensitive
+.env
+.env.backend
+*.local

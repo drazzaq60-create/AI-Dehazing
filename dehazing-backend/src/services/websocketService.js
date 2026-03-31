@@ -1,11 +1,9 @@
-// const WebSocket = require('ws');
-// const aiService = require('./aiService');
-// const switchingService = require('./switchingService');
-// const gridfsStorage = require('./gridfsStorageService');  // ✅ NEW
-// const VideoCapture = require('../models/VideoCapture');    // ✅ NEW
-// const Log = require('../models/Log');
-// const Session = require('../models/Session');
-// const { v4: uuidv4 } = require('uuid');  // ✅ NEW
+const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const aiService = require('./aiService');
+const { v4: uuidv4 } = require('uuid');
 
 // const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8080 });
 
@@ -2564,29 +2562,33 @@ async function handleBinaryFrame(ws, metadata, binaryData) {
 
   console.log(`📸 Binary frame ${frameNumber} received (${binaryData.length} bytes) @ ${session.fps} FPS`);
 
-  // For now, simulate AI processing (replace with real AI later)
-  const processingTime = session.mode === 'cloud' ? 20 : 50;
-  await new Promise(resolve => setTimeout(resolve, processingTime));
+  // Broadcast processed frame back as Base64 with prefix (Deep Focus Solution)
+  const base64WithPrefix = `data:image/jpeg;base64,${binaryData.toString('base64')}`;
 
-  // Send processed frame back as binary
-  // First send metadata
-  ws.send(JSON.stringify({
+  const output = JSON.stringify({
     type: 'processed_frame',
     sessionId,
     frameNumber,
     frameCount: session.frameCount,
     fps: session.fps,
-    processingTime: processingTime,
+    processingTime: 0,
     mode: session.mode,
     timestamp: Date.now(),
-    isBinary: true  // Flag to indicate binary follows
-  }));
+    originalFrame: base64WithPrefix,
+    processedFrame: base64WithPrefix,
+    isBinary: false
+  });
 
-  // Then send original binary (as hazy frame)
-  ws.send(binaryData);
+  // Direct send back to sender
+  try { ws.send(output); } catch (e) { }
 
-  // Send processed binary (same for now, replace with AI output later)
-  ws.send(binaryData);
+  if (wss && wss.clients) {
+    wss.clients.forEach(client => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(output);
+      }
+    });
+  }
 }
 
 const activeRealtimeSessions = new Map();
@@ -2596,16 +2598,24 @@ async function handleStartProcessing(ws, clientId, data) {
 
   const newSessionId = sessionId || `realtime_${userId}_${Date.now()}`;
 
+  // Create temp directory for this session
+  const tempDir = path.join(__dirname, '..', '..', 'temp', newSessionId);
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
   activeRealtimeSessions.set(newSessionId, {
     clientId,
     userId,
     mode,
-    ws,  // Store WebSocket reference
+    ws,
+    tempDir, // Store temp directory path
     frames: [],
     startTime: Date.now(),
     frameCount: 0,
     lastFrameTime: Date.now(),
-    fps: 0
+    fps: 0,
+    isGeneratingVideo: false
   });
 
   ws.send(JSON.stringify({
@@ -2614,7 +2624,7 @@ async function handleStartProcessing(ws, clientId, data) {
     timestamp: Date.now()
   }));
 
-  console.log(`🎬 Real-time session started: ${newSessionId}`);
+  console.log(`🎬 Real-time session started: ${newSessionId} (Temp: ${tempDir})`);
 }
 
 async function handleVideoFrame(ws, data) {
@@ -2634,6 +2644,11 @@ async function handleVideoFrame(ws, data) {
 
   session.frameCount++;
 
+  // Throttled logging
+  if (session.frameCount % 20 === 1) {
+    console.log(`📸 Frame ${session.frameCount} received for session ${sessionId} @ ${session.fps} FPS`);
+  }
+
   // ✅ INSTANT ACKNOWLEDGMENT
   ws.send(JSON.stringify({
     type: 'frame_acknowledged',
@@ -2643,44 +2658,54 @@ async function handleVideoFrame(ws, data) {
     queuePosition: session.frameCount
   }));
 
-  // 🔥 REAL-TIME PROCESSING (Simulated for now)
+  // Process with AI
+  let processedFrameBase64 = frame;
   try {
-    // Simulate AI processing delay
-    const processingTime = mode === 'cloud' ? 40 : 80;
-    await new Promise(resolve => setTimeout(resolve, processingTime));
+    // Call the actual AI service
+    processedFrameBase64 = await aiService.processFrame(frame, mode);
+  } catch (error) {
+    console.error('AI Processing error, using original frame:', error.message);
+  }
 
-    // For now, return same frame (replace with real AI)
-    const processedFrame = frame;
+  const prefix = 'data:image/jpeg;base64,';
+  const originalFrame = frame.startsWith('data:') ? frame : `${prefix}${frame}`;
+  const processedFrame = processedFrameBase64.startsWith('data:') ? processedFrameBase64 : `${prefix}${processedFrameBase64}`;
 
-    // Send processed frame back IMMEDIATELY
-    ws.send(JSON.stringify({
-      type: 'processed_frame',
-      sessionId,
-      frameNumber,
-      originalFrame: frame, // For comparison
-      processedFrame: processedFrame,
-      frameCount: session.frameCount,
-      fps: session.fps,
-      processingTime: processingTime,
-      mode: mode,
-      timestamp: Date.now()
-    }));
+  // Send processed frame back
+  const output = JSON.stringify({
+    type: 'processed_frame',
+    sessionId,
+    frameNumber,
+    originalFrame: originalFrame,
+    processedFrame: processedFrame,
+    fps: session.fps,
+    frameCount: session.frameCount,
+    processingTime: Date.now() - now
+  });
 
-    // Store frame for potential video generation
-    session.frames.push({
-      frameNumber,
-      timestamp: now,
-      originalFrame: frame,
-      processedFrame: processedFrame
+  try { ws.send(output); } catch (e) { }
+
+  // Broadcast to other clients if needed
+  if (wss && wss.clients) {
+    wss.clients.forEach(client => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(output);
+      }
     });
+  }
 
-    // Keep only recent frames (memory management)
-    if (session.frames.length > 100) {
-      session.frames.shift();
+  // ✅ SAVE DEHAZED FRAME TO DISK (Synchronous ensures integrity for FFmpeg)
+  try {
+    const cleanBase64 = processedFrame.replace(/^data:image\/[a-z]+;base64,/, '');
+    const framePath = path.join(session.tempDir, `dehazed_${frameNumber.toString().padStart(6, '0')}.jpg`);
+
+    if (session.frameCount === 1) {
+      console.log(`💾 First frame saving to: ${framePath}`);
     }
 
+    fs.writeFileSync(framePath, cleanBase64, 'base64');
   } catch (error) {
-    console.error(`❌ Frame processing error:`, error);
+    console.error(`❌ Disk I/O error for frame ${frameNumber}:`, error.message);
   }
 }
 
@@ -2692,35 +2717,128 @@ async function handleStopProcessing(clientId, data) {
 
   console.log(`🛑 Stopping real-time session: ${sessionId} (${session.frameCount} frames)`);
 
-  // Use ws from session instead of connections map
+  const duration = Date.now() - session.startTime;
+  const avgFps = Math.round(session.frameCount / (duration / 1000));
+
+  // Use ws from session
   if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-    // Send final stats
     session.ws.send(JSON.stringify({
       type: 'processing_complete',
       sessionId,
       totalFrames: session.frameCount,
-      avgFps: Math.round(session.frameCount / ((Date.now() - session.startTime) / 1000)),
-      duration: Date.now() - session.startTime,
+      avgFps,
+      duration,
       mode: session.mode
     }));
 
-    // Offer video download
-    session.ws.send(JSON.stringify({
-      type: 'video_ready',
-      sessionId,
-      message: 'Processed frames available for video generation',
-      frameCount: session.frameCount
-    }));
+    // IF we have frames, generate video
+    if (session.frameCount > 0 && !session.isGeneratingVideo) {
+      session.isGeneratingVideo = true;
+
+      console.log(`🎬 Generating video for session ${sessionId}...`);
+      console.log(`📂 Source Frames Pattern: ${path.join(session.tempDir, 'dehazed_%06d.jpg')}`);
+      console.log(`🎯 Output Video Path: ${path.join(session.tempDir, 'output.mp4')}`);
+
+      generateVideo(session.tempDir)
+        .then(() => {
+          if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify({
+              type: 'video_ready',
+              sessionId,
+              downloadUrl: `/api/download/${sessionId}`,
+              message: 'Video compilation complete. You can now download the dehazed video.',
+              frameCount: session.frameCount
+            }));
+          }
+          console.log(`✅ Video ready for download: ${sessionId}`);
+        })
+        .catch(err => {
+          console.error(`❌ Video generation failed for ${sessionId}:`, err.message);
+          if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Video generation failed: ' + err.message
+            }));
+          }
+        });
+    }
   }
 
-  // Cleanup after delay
+  // Cleanup after 1 hour (give user time to download)
   setTimeout(() => {
-    activeRealtimeSessions.delete(sessionId);
-  }, 30000); // Keep session for 30 seconds
+    cleanupSession(sessionId);
+  }, 60 * 60 * 1000);
+}
+
+/**
+ * Generate MP4 video from JPG frames using FFmpeg
+ */
+async function generateVideo(tempDir) {
+  return new Promise((resolve, reject) => {
+    const videoPath = path.join(tempDir, 'output.mp4');
+
+    // -framerate 10: 10 FPS
+    // -pattern_type glob -i 'dehazed_*.jpg': process all dehazed images
+    // -c:v libx264: H.264 codec
+    // -pix_fmt yuv420p: for maximum compatibility
+    const ffmpeg = spawn('ffmpeg', [
+      '-y', // Overwrite output file
+      '-framerate', '10',
+      '-i', path.join(tempDir, 'dehazed_%06d.jpg'), // Uses sequential numbering
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-preset', 'fast',
+      videoPath
+    ]);
+
+    ffmpeg.stderr.on('data', (data) => {
+      console.log(`[FFmpeg] ${data.toString()}`);
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        resolve(videoPath);
+      } else {
+        console.error(`❌ FFmpeg exited with code ${code}`);
+        reject(new Error(`FFmpeg exited with code ${code}`));
+      }
+    });
+
+    ffmpeg.on('error', (err) => {
+      console.error(`❌ FFmpeg Error: ${err.message}`);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Delete temp folder and session data
+ */
+function cleanupSession(sessionId) {
+  const session = activeRealtimeSessions.get(sessionId);
+  if (session && session.tempDir) {
+    try {
+      if (fs.existsSync(session.tempDir)) {
+        fs.rmSync(session.tempDir, { recursive: true, force: true });
+        console.log(`🧹 Cleaned up session storage: ${sessionId}`);
+      }
+    } catch (error) {
+      console.error(`❌ Cleanup error for ${sessionId}:`, error.message);
+    }
+  }
+  activeRealtimeSessions.delete(sessionId);
+}
+
+async function handleSwitchMode(clientId, data) {
+  const { sessionId, mode } = data;
+  const session = activeRealtimeSessions.get(sessionId);
+  if (session) {
+    session.mode = mode;
+    console.log(`🔄 Switched session ${sessionId} to ${mode} mode`);
+  }
 }
 
 // WebSocket Server Instance
-const WebSocket = require('ws');
 let wss = null;
 
 // Initialize WebSocket with HTTP server
@@ -2771,6 +2889,9 @@ function initWebSocket(server) {
             break;
           case 'stop_processing':
             await handleStopProcessing(clientId, data);
+            break;
+          case 'switch_mode':
+            await handleSwitchMode(clientId, data);
             break;
           case 'ping':
             ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));

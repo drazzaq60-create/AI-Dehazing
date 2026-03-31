@@ -25,5 +25,18 @@
   },
   "devDependencies": {
     "nodemon": "latest"
+  },
+  "nodemonConfig": {
+    "ignore": [
+      "temp/*",
+      "images/*",
+      "*.mp4",
+      "node_modules"
+    ],
+    "watch": [
+      "src/**/*",
+      ".env"
+    ],
+    "ext": "js,mjs,json"
   }
 }

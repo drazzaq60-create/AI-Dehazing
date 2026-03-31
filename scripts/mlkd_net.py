@@ -82,11 +82,24 @@ def dehaze_frame(frame_base64):
         return frame_base64
 
 if __name__ == "__main__":
-    # Simulate processing delay (slightly longer than AOD-Net)
-    time.sleep(0.08)
-    
-    input_data = sys.stdin.read()
-    if input_data.strip():
-        result = dehaze_frame(input_data)
-        sys.stdout.write(result)
-        sys.stdout.flush()
+    # Persistent loop for real-time processing
+    # Blocks until a new base64 line is received
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                # Actual EOF
+                break
+            
+            input_data = line.strip()
+            if not input_data:
+                continue
+                
+            result = dehaze_frame(input_data)
+            sys.stdout.write(result + "\n")
+            sys.stdout.flush()
+        except EOFError:
+            break
+        except Exception as e:
+            sys.stderr.write(f"Error in daemon loop: {e}\n")
+            sys.stderr.flush()

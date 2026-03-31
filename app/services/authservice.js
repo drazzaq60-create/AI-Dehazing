@@ -5,10 +5,10 @@ import { Platform } from 'react-native';
 // IMPORTANT: For iOS/Android, use your computer's local IP address
 // You can set this in a .env file as EXPO_PUBLIC_API_URL=http://YOUR_IP:3000
 const API_URL = process.env.EXPO_PUBLIC_API_URL || Platform.select({
-  ios: 'http://192.168.18.84:3000',      // Change this to your Mac's IP
-  android: 'http://192.168.18.84:3000',  // Change this to your Mac's IP
+  ios: 'http://172.20.10.7:3000',      // Change this to your Mac's IP
+  android: 'http://172.20.10.7:3000',  // Change this to your Mac's IP
   web: 'http://localhost:3000',
-  default: 'http://192.168.18.21:3000'
+  default: 'http://172.20.10.7:3000'
 });
 
 console.log('🔗 API URL configured:', API_URL);

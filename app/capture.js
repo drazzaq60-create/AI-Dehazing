@@ -1,8 +1,9 @@
-// capture.js - Real-time Video Capture with Vision Camera + Binary WebSocket
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Image,
   Platform,
   StyleSheet,
   Text,
@@ -12,7 +13,7 @@ import {
 import { useAppContext } from './_layout';
 
 // Vision Camera imports
-import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import { Camera, useCameraDevice, useCameraFormat, useCameraPermission } from 'react-native-vision-camera';
 
 export default function CaptureScreen() {
   const router = useRouter();
@@ -27,9 +28,12 @@ export default function CaptureScreen() {
   const [fps, setFps] = useState(0);
   const [sessionId, setSessionId] = useState(null);
   const [status, setStatus] = useState('Ready');
+  const [dehazedFrame, setDehazedFrame] = useState(null);
+  const [serverFps, setServerFps] = useState(0);
 
   const cameraRef = useRef(null);
   const captureIntervalRef = useRef(null);
+  const captureTimerRef = useRef(null);
   const startTimeRef = useRef(null);
   const frameCountRef = useRef(0);
   const isRecordingRef = useRef(false);
@@ -40,54 +44,46 @@ export default function CaptureScreen() {
   // Get current device based on facing
   const currentDevice = useCameraDevice(facing);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopCapture();
-    };
-  }, []);
+  // Filter for LOWEST resolution to maximize FPS (Deep Focus Authentic Solution)
+  const format = useCameraFormat(currentDevice, [
+    { videoResolution: { width: 320, height: 240 } },
+    { photoResolution: { width: 320, height: 240 } },
+    { fps: 60 }
+  ]);
 
-  // Listen for backend responses
+  // Listen for processed frames from backend
   useEffect(() => {
     if (!wsService) return;
 
     const handleMessage = (data) => {
-      if (data.type === 'session_created') {
-        setSessionId(data.sessionId);
-        setStatus('Capturing...');
-        console.log('Session created:', data.sessionId);
+      if (data.type === 'processed_frame' && data.sessionId === currentSessionIdRef.current) {
+        if (data.processedFrame) {
+          setDehazedFrame(data.processedFrame);
+        }
+        setServerFps(data.fps || 0);
       }
     };
 
     wsService.on('message', handleMessage);
-    return () => wsService.off('message', handleMessage);
+    return () => {
+      wsService.off('message', handleMessage);
+      isRecordingRef.current = false;
+      if (captureTimerRef.current) clearTimeout(captureTimerRef.current);
+    };
   }, [wsService]);
 
-  // Start capturing - using takePhoto + binary send
+  // Start capturing frames manually in a loop to control FPS precisely
   const startCapture = async () => {
-    if (!currentDevice || !cameraRef.current) {
-      setStatus('Camera not ready');
+    if (!cameraRef.current) {
+      setStatus('Error: Camera not ready');
       return;
     }
 
-    if (!wsService?.isConnected) {
-      setStatus('Backend not connected');
-      return;
-    }
-
-    // Create session
     const newSessionId = `capture_${Date.now()}`;
     setSessionId(newSessionId);
     currentSessionIdRef.current = newSessionId;
-    setIsRecording(true);
-    isRecordingRef.current = true;
-    setFrameCount(0);
-    frameCountRef.current = 0;
-    startTimeRef.current = Date.now();
-    lastFrameTimeRef.current = Date.now();
-    setStatus('Starting...');
 
-    // Tell backend to start processing
+    // Start session on backend
     wsService.send({
       type: 'start_processing',
       userId: user?.id || 'anonymous',
@@ -95,75 +91,86 @@ export default function CaptureScreen() {
       sessionId: newSessionId
     });
 
-    // Capture at target 20 FPS = every 50ms
-    captureIntervalRef.current = setInterval(async () => {
-      if (!isRecordingRef.current || !cameraRef.current || isTakingPhotoRef.current) return;
+    setIsRecording(true);
+    isRecordingRef.current = true;
+    frameCountRef.current = 0;
+    setFrameCount(0);
+    setStatus('Capturing...');
+
+    // THE PARALLEL FPS PIPE (Deep Focus Authentic Solution)
+    const captureFrame = async () => {
+      if (!isRecordingRef.current) return;
 
       try {
-        isTakingPhotoRef.current = true;
+        const now = Date.now();
+        const timeSinceLast = now - lastFrameTimeRef.current;
 
-        // Vision Camera takePhoto - faster than expo-camera
-        const photo = await cameraRef.current.takePhoto({
-          qualityPrioritization: 'speed',
-          flash: 'off',
-          enableShutterSound: false,
-        });
-
-        if (!isRecordingRef.current) {
-          isTakingPhotoRef.current = false;
+        // Target ~20 FPS (50ms interval)
+        if (timeSinceLast < 50) {
+          captureTimerRef.current = setTimeout(captureFrame, 5);
           return;
         }
 
-        frameCountRef.current++;
-        const currentFrame = frameCountRef.current;
-        setFrameCount(currentFrame);
-
-        // Calculate FPS
-        const now = Date.now();
-        const timeDiff = now - lastFrameTimeRef.current;
-        if (timeDiff > 0) {
-          const currentFps = Math.round(1000 / timeDiff);
-          setFps(currentFps);
-        }
-        lastFrameTimeRef.current = now;
-
-        // Read file as ArrayBuffer (BINARY - no base64!)
-        const response = await fetch(`file://${photo.path}`);
-        const arrayBuffer = await response.arrayBuffer();
-
-        // Send metadata first, then binary
-        wsService.sendBinary(arrayBuffer, {
-          type: 'binary_frame',
-          frameNumber: currentFrame,
-          sessionId: currentSessionIdRef.current,
-          userId: user?.id || 'anonymous',
-          timestamp: now
+        // 1. FAST CAMERA SNAPSHOT (Bypasses Sensor Processing)
+        const photo = await cameraRef.current.takeSnapshot({
+          quality: 50
         });
 
-        setStatus(`Capturing: ${currentFrame} frames @ ${fps} FPS`);
+        lastFrameTimeRef.current = Date.now();
+        frameCountRef.current++;
+        const currentFrame = frameCountRef.current;
 
-        // Delete temp file
-        try {
-          const RNFS = require('react-native-fs');
-          await RNFS.unlink(photo.path);
-        } catch (e) { }
+        // 2. PARALLEL PROCESSING (Non-Blocking)
+        (async () => {
+          try {
+            // No resize needed if we're already at 320x240, but base64 is still required
+            const manipulated = await manipulateAsync(
+              photo.path.startsWith('file') ? photo.path : `file://${photo.path}`,
+              [], // No resize needed if format is already small
+              { compress: 0.5, format: SaveFormat.JPEG, base64: true }
+            );
 
-        isTakingPhotoRef.current = false;
+            wsService.send({
+              type: 'video_frame',
+              frame: manipulated.base64,
+              frameNumber: currentFrame,
+              sessionId: currentSessionIdRef.current,
+              userId: user?.id || 'anonymous',
+              timestamp: Date.now()
+            });
+
+            // Occasional UI updates for diagnostics to avoid UI lag (Every 10 frames)
+            if (currentFrame % 10 === 0) {
+              setFrameCount(currentFrame);
+              setFps(Math.round(1000 / (Date.now() - now)));
+            }
+          } catch (err) {
+            console.error('Parallel work error:', err);
+          }
+        })();
+
+        // 3. IMMEDIATELY START NEXT CAPTURE CYCLE
+        captureTimerRef.current = setTimeout(captureFrame, 1);
 
       } catch (error) {
-        isTakingPhotoRef.current = false;
-        if (isRecordingRef.current) {
-          console.error('Frame capture error:', error);
-        }
+        console.error('Fast capture error:', error);
+        captureTimerRef.current = setTimeout(captureFrame, 200);
       }
-    }, 50); // Target 20 FPS
+    };
+
+    // Start the loop
+    lastFrameTimeRef.current = Date.now();
+    captureFrame();
   };
 
   // Stop capturing
   const stopCapture = () => {
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
+    isRecordingRef.current = false;
+    setIsRecording(false);
+
+    if (captureTimerRef.current) {
+      clearTimeout(captureTimerRef.current);
+      captureTimerRef.current = null;
     }
 
     if (currentSessionIdRef.current && wsService?.isConnected) {
@@ -173,8 +180,6 @@ export default function CaptureScreen() {
       });
     }
 
-    setIsRecording(false);
-    isRecordingRef.current = false;
     setStatus(`Done: ${frameCountRef.current} frames captured`);
   };
 
@@ -226,6 +231,7 @@ export default function CaptureScreen() {
   if (!currentDevice) {
     return (
       <View style={styles.centerContainer}>
+        <ActivityIndicator size="large" color="#3b82f6" />
         <Text style={styles.errorText}>❌ No camera device found</Text>
         <TouchableOpacity style={styles.primaryButton} onPress={() => router.back()}>
           <Text style={styles.buttonText}>Go Back</Text>
@@ -241,7 +247,7 @@ export default function CaptureScreen() {
         <TouchableOpacity onPress={() => router.back()}>
           <Text style={styles.backButton}>← Back</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>Binary Capture</Text>
+        <Text style={styles.title}>DEEP SCAN MODE v2</Text>
         <View style={[styles.statusBadge, isRecording && styles.recordingBadge]}>
           <Text style={styles.statusText}>
             {isRecording ? `🔴 ${fps} FPS` : (isConnected ? '🟢 Ready' : '🔴 Offline')}
@@ -255,17 +261,36 @@ export default function CaptureScreen() {
           ref={cameraRef}
           style={styles.camera}
           device={currentDevice}
+          format={format}
           isActive={true}
           photo={true}
+          video={true}
+          enableHighQualityPhotos={false}
+          enableAutoStabilization={false}
+          exposure={0}
+          lowLightBoost={false}
         />
 
         {/* Recording Overlay */}
         {isRecording && (
           <View style={styles.recordingOverlay}>
             <View style={styles.recordingDot} />
-            <Text style={styles.recordingText}>BINARY MODE</Text>
+            <Text style={styles.recordingText}>REAL-TIME DEHAZING</Text>
+            <Text style={styles.statsText}>Camera FPS: {fps}</Text>
+            <Text style={styles.statsText}>Server FPS: {serverFps}</Text>
             <Text style={styles.statsText}>Frames: {frameCount}</Text>
-            <Text style={styles.statsText}>FPS: {fps}</Text>
+          </View>
+        )}
+
+        {/* Dehazed Preview Overlay */}
+        {isRecording && dehazedFrame && (
+          <View style={styles.previewOverlay}>
+            <Text style={styles.previewLabel}>DEHAZED OUTPUT</Text>
+            <Image
+              source={{ uri: dehazedFrame }}
+              style={styles.previewImage}
+              resizeMode="cover"
+            />
           </View>
         )}
       </View>
@@ -279,7 +304,7 @@ export default function CaptureScreen() {
             disabled={!isConnected}
           >
             <Text style={styles.buttonText}>
-              {isConnected ? '▶️ Start Binary Capture (20 FPS)' : '❌ Backend Offline'}
+              {isConnected ? '🚀 Start Ultra-FPS Capture' : '❌ Backend Offline'}
             </Text>
           </TouchableOpacity>
         ) : (
@@ -297,10 +322,10 @@ export default function CaptureScreen() {
         </TouchableOpacity>
 
         <View style={styles.statusBox}>
-          <Text style={styles.statusTitle}>Status</Text>
+          <Text style={styles.statusTitle}>Network Optimization Status</Text>
           <Text style={styles.statusValue}>{status}</Text>
           <Text style={styles.statusValue}>
-            Backend: {isConnected ? '✅ Connected' : '❌ Disconnected'}
+            Payload: ~30KB/frame (320px compressed)
           </Text>
         </View>
 
@@ -308,7 +333,7 @@ export default function CaptureScreen() {
           style={styles.processButton}
           onPress={() => router.push('/processing')}
         >
-          <Text style={styles.buttonText}>📊 Go to Processing Screen</Text>
+          <Text style={styles.buttonText}>📊 View Real-time Dehazing</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -374,18 +399,45 @@ const styles = StyleSheet.create({
     width: 12,
     height: 12,
     borderRadius: 6,
-    backgroundColor: '#22c55e',
+    backgroundColor: '#ef4444',
     marginBottom: 8,
   },
   recordingText: {
-    color: '#22c55e',
+    color: '#ef4444',
     fontSize: 14,
     fontWeight: 'bold',
   },
   statsText: {
     color: '#fff',
     fontSize: 12,
-    marginTop: 4,
+    marginTop: 2,
+  },
+  previewOverlay: {
+    position: 'absolute',
+    bottom: 16,
+    right: 16,
+    width: 140,
+    height: 105,
+    backgroundColor: '#000',
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#3b82f6',
+    overflow: 'hidden',
+  },
+  previewLabel: {
+    position: 'absolute',
+    top: 2,
+    left: 4,
+    zIndex: 10,
+    color: '#3b82f6',
+    fontSize: 8,
+    fontWeight: 'bold',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    paddingHorizontal: 4,
+    borderRadius: 2,
+  },
+  previewImage: {
+    flex: 1,
   },
   controls: {
     flex: 1,

@@ -553,6 +553,13 @@ function LoginScreen({ onLogin, onNavigateToSignup, onNavigateToForgotPassword }
             >
               <Text style={styles.signupButtonText}>Create New Account</Text>
             </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.secondaryButton, { marginTop: 20, borderColor: '#ef4444' }]}
+              onPress={() => onLogin({ name: 'Guest User', id: 'guest' })}
+            >
+              <Text style={[styles.secondaryButtonText, { color: '#ef4444' }]}>🛠️ Debug: Bypass Login (Guest Mode)</Text>
+            </TouchableOpacity>
           </View>
         ) : (
           <View style={styles.formContainer}>

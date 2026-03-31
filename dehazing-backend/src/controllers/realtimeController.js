@@ -9,13 +9,13 @@ const activeSessions = new Map();
 exports.startRealtimeSession = async (req, res) => {
   const { userId, mode = 'cloud' } = req.body;
   const sessionId = `rt_${userId}_${Date.now()}_${uuidv4().substring(0, 8)}`;
-  
+
   // Create temp directory
   const tempDir = path.join(__dirname, '..', '..', 'temp', sessionId);
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
-  
+
   activeSessions.set(sessionId, {
     userId,
     mode,
@@ -24,12 +24,12 @@ exports.startRealtimeSession = async (req, res) => {
     startTime: Date.now(),
     frameCount: 0
   });
-  
+
   // Auto-cleanup after 1 hour
   setTimeout(() => {
     cleanupSession(sessionId);
   }, 60 * 60 * 1000);
-  
+
   res.json({
     success: true,
     sessionId,
@@ -42,14 +42,14 @@ exports.startRealtimeSession = async (req, res) => {
 exports.processFrame = async (req, res) => {
   const { sessionId, frame, frameNumber, mode = 'cloud' } = req.body;
   const session = activeSessions.get(sessionId);
-  
+
   if (!session) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Session not found' 
+    return res.status(404).json({
+      success: false,
+      error: 'Session not found'
     });
   }
-  
+
   // ✅ Immediate response
   res.json({
     success: true,
@@ -57,23 +57,23 @@ exports.processFrame = async (req, res) => {
     received: true,
     timestamp: Date.now()
   });
-  
-  // Process in background
+
+  // Process in background - FAST PATH (no AI processing for now)
   try {
-    const processed = await processWithAI(frame, mode || session.mode);
-    
-    // Save frame
-    const cleanFrame = processed.replace(/^data:image\/[a-z]+;base64,/, '');
+    // Skip AI processing for speed - just save frame directly
+    const cleanFrame = frame.replace(/^data:image\/[a-z]+;base64,/, '');
     const framePath = path.join(session.tempDir, `dehazed_${frameNumber.toString().padStart(6, '0')}.jpg`);
     fs.writeFileSync(framePath, cleanFrame, 'base64');
-    
+
     session.frames.push({
       frameNumber,
       timestamp: Date.now(),
       framePath
     });
     session.frameCount++;
-    
+
+    console.log(`✅ Frame ${frameNumber} saved (fast mode)`);
+
   } catch (error) {
     console.error('Frame processing error:', error);
   }
@@ -83,28 +83,28 @@ exports.processFrame = async (req, res) => {
 exports.stopSession = async (req, res) => {
   const { sessionId } = req.body;
   const session = activeSessions.get(sessionId);
-  
+
   if (!session) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Session not found' 
+    return res.status(404).json({
+      success: false,
+      error: 'Session not found'
     });
   }
-  
+
   if (session.frameCount === 0) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'No frames processed' 
+    return res.status(400).json({
+      success: false,
+      error: 'No frames processed'
     });
   }
-  
+
   console.log(`🎬 Generating video from ${session.frameCount} frames`);
-  
+
   try {
     // Generate video
     const videoPath = path.join(session.tempDir, 'output.mp4');
     await generateVideo(session.tempDir, videoPath);
-    
+
     res.json({
       success: true,
       sessionId,
@@ -112,12 +112,12 @@ exports.stopSession = async (req, res) => {
       frameCount: session.frameCount,
       duration: Date.now() - session.startTime
     });
-    
+
   } catch (error) {
     console.error('Video generation error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Video generation failed' 
+    res.status(500).json({
+      success: false,
+      error: 'Video generation failed'
     });
   }
 };
@@ -125,17 +125,17 @@ exports.stopSession = async (req, res) => {
 // Download video
 exports.downloadVideo = (req, res) => {
   const session = activeSessions.get(req.params.sessionId);
-  
+
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
-  
+
   const videoPath = path.join(session.tempDir, 'output.mp4');
-  
+
   if (!fs.existsSync(videoPath)) {
     return res.status(404).json({ error: 'Video not found' });
   }
-  
+
   res.download(videoPath, `dehazed_${req.params.sessionId}.mp4`, (err) => {
     if (err) {
       console.error('Download error:', err);
@@ -146,27 +146,27 @@ exports.downloadVideo = (req, res) => {
 // Helper functions
 async function processWithAI(frameBase64, mode) {
   return new Promise((resolve) => {
-    const script = mode === 'cloud' 
+    const script = mode === 'cloud'
       ? path.join(__dirname, '..', '..', 'scripts', 'aod_net.py')
       : path.join(__dirname, '..', '..', 'scripts', 'mlkd_net.py');
-    
+
     const cleanFrame = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-    
+
     const pythonProcess = spawn('python', [script]);
-    
+
     let result = '';
-    
+
     pythonProcess.stdout.on('data', (data) => {
       result += data.toString();
     });
-    
+
     pythonProcess.on('close', () => {
       resolve(result.trim() || frameBase64);
     });
-    
+
     pythonProcess.stdin.write(cleanFrame);
     pythonProcess.stdin.end();
-    
+
     setTimeout(() => {
       pythonProcess.kill();
       resolve(frameBase64);
@@ -186,7 +186,7 @@ async function generateVideo(framesDir, outputPath) {
       '-crf', '23',
       outputPath
     ]);
-    
+
     ffmpeg.on('close', (code) => {
       if (code === 0) {
         resolve();
@@ -194,7 +194,7 @@ async function generateVideo(framesDir, outputPath) {
         reject(new Error(`FFmpeg failed with code ${code}`));
       }
     });
-    
+
     ffmpeg.on('error', reject);
   });
 }
@@ -215,11 +215,11 @@ function cleanupSession(sessionId) {
 // Get session status
 exports.getSessionStatus = (req, res) => {
   const session = activeSessions.get(req.params.sessionId);
-  
+
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
-  
+
   res.json({
     success: true,
     sessionId: req.params.sessionId,

@@ -150,8 +150,8 @@ const server = http.createServer(app);
 // Connect to MongoDB
 connectDB();
 
-// Initialize WebSocket
-initWebSocket(server);
+// Initialize WebSocket will happen after listen
+// initWebSocket(server);
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
@@ -173,18 +173,48 @@ app.get('/api/download/:sessionId', (req, res) => {
   const fs = require('fs');
   const videoPath = path.join(__dirname, '..', 'temp', req.params.sessionId, 'output.mp4');
 
+  console.log(`📥 Download request for ${req.params.sessionId}`);
+  console.log(`🔍 Checking path: ${videoPath}`);
+
   if (fs.existsSync(videoPath)) {
+    console.log(`✅ File found! Sending to client...`);
     res.download(videoPath, `dehazed_${req.params.sessionId}.mp4`);
   } else {
-    res.status(404).json({ error: 'Video not found' });
+    console.error(`❌ File NOT found at: ${videoPath}`);
+    res.status(404).json({ error: 'Video not found', path: videoPath });
   }
 });
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  const localIP = getLocalIP();
-  console.log(`🚀 Backend running on port ${PORT}`);
-  console.log(`🌐 WebSocket ready on ws://${localIP}:${PORT}`);
-  console.log(`📱 Mobile should connect to: http://${localIP}:${PORT}`);
-  console.log(`📡 Real-time processing available at /api/realtime`);
-});
 
+function startServer() {
+  console.log(`🔍 Preparing port ${PORT}...`);
+  try {
+    const { execSync } = require('child_process');
+    execSync(`lsof -ti:${PORT} | xargs kill -9`);
+    console.log(`✅ Port ${PORT} cleared. COOL-DOWN: Waiting 5s for OS to release socket...`);
+  } catch (e) {
+    // Port was likely already free
+  }
+
+  // 5s delay for stubborn macOS sockets
+  setTimeout(() => {
+    console.log(`🚀 Attempting to bind to port ${PORT}...`);
+    server.listen(PORT, '0.0.0.0', () => {
+      const localIP = getLocalIP();
+      console.log(`✅ SUCCESS: Backend running on port ${PORT}`);
+      console.log(`🌐 WebSocket ready on ws://${localIP}:${PORT}`);
+      console.log(`📱 Mobile should connect to: http://${localIP}:${PORT}`);
+
+      console.log('🔌 Initializing WebSocket server...');
+      initWebSocket(server);
+      console.log('✅ WebSocket server initialized and ready.');
+    });
+
+    server.on('error', (err) => {
+      console.error(`❌ CRITICAL: Server failed to start: ${err.message}`);
+      process.exit(1);
+    });
+  }, 5000);
+}
+
+startServer();
