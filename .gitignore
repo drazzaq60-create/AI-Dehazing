@@ -51,7 +51,7 @@ dehazing-backend/node_modules/
 dehazing-backend/temp/
 dehazing-backend/images/
 
-# Sensitive
-.env
+# Sensitive (Commit if Private Repo)
+# .env
 .env.backend
 *.local
