@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const aiService = require('../services/aiService');
 
 const activeSessions = new Map();
 
@@ -58,10 +59,10 @@ exports.processFrame = async (req, res) => {
     timestamp: Date.now()
   });
 
-  // Process in background - FAST PATH (no AI processing for now)
+  // Process in background — run frame through AI dehazing daemon
   try {
-    // Skip AI processing for speed - just save frame directly
-    const cleanFrame = frame.replace(/^data:image\/[a-z]+;base64,/, '');
+    const processedFrame = await aiService.processFrame(frame, mode);
+    const cleanFrame = (processedFrame || frame).replace(/^data:image\/[a-z]+;base64,/, '');
     const framePath = path.join(session.tempDir, `dehazed_${frameNumber.toString().padStart(6, '0')}.jpg`);
     fs.writeFileSync(framePath, cleanFrame, 'base64');
 
@@ -72,7 +73,7 @@ exports.processFrame = async (req, res) => {
     });
     session.frameCount++;
 
-    console.log(`✅ Frame ${frameNumber} saved (fast mode)`);
+    console.log(`Frame ${frameNumber} processed and saved`);
 
   } catch (error) {
     console.error('Frame processing error:', error);

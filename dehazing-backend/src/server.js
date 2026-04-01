@@ -187,34 +187,30 @@ app.get('/api/download/:sessionId', (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 function startServer() {
-  console.log(`🔍 Preparing port ${PORT}...`);
-  try {
-    const { execSync } = require('child_process');
-    execSync(`lsof -ti:${PORT} | xargs kill -9`);
-    console.log(`✅ Port ${PORT} cleared. COOL-DOWN: Waiting 5s for OS to release socket...`);
-  } catch (e) {
-    // Port was likely already free
-  }
+  console.log(`Preparing port ${PORT}...`);
 
-  // 5s delay for stubborn macOS sockets
-  setTimeout(() => {
-    console.log(`🚀 Attempting to bind to port ${PORT}...`);
-    server.listen(PORT, '0.0.0.0', () => {
-      const localIP = getLocalIP();
-      console.log(`✅ SUCCESS: Backend running on port ${PORT}`);
-      console.log(`🌐 WebSocket ready on ws://${localIP}:${PORT}`);
-      console.log(`📱 Mobile should connect to: http://${localIP}:${PORT}`);
+  server.listen(PORT, '0.0.0.0', () => {
+    const localIP = getLocalIP();
+    console.log('='.repeat(50));
+    console.log(`Backend running on port ${PORT}`);
+    console.log(`HTTP API:    http://${localIP}:${PORT}`);
+    console.log(`WebSocket:   ws://${localIP}:${PORT}`);
+    console.log(`Mobile app should connect to: http://${localIP}:${PORT}`);
+    console.log('='.repeat(50));
 
-      console.log('🔌 Initializing WebSocket server...');
-      initWebSocket(server);
-      console.log('✅ WebSocket server initialized and ready.');
-    });
+    console.log('Initializing WebSocket server...');
+    initWebSocket(server);
+    console.log('WebSocket server initialized and ready.');
+  });
 
-    server.on('error', (err) => {
-      console.error(`❌ CRITICAL: Server failed to start: ${err.message}`);
-      process.exit(1);
-    });
-  }, 5000);
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Stop the other process or use a different port.`);
+    } else {
+      console.error(`Server failed to start: ${err.message}`);
+    }
+    process.exit(1);
+  });
 }
 
 startServer();

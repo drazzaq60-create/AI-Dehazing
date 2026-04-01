@@ -1,72 +1,6 @@
-// const { spawn } = require('child_process');
-
-// exports.processFrame = async (frame, mode) => {
-//   return new Promise((resolve) => {
-//     const script = mode === 'cloud' ? 'scripts/map_net.py' : 'scripts/aod_net.py';
-//     const python = spawn('python', [script, frame]);
-//     python.stdout.on('data', (data) => resolve(data.toString()));
-//     python.stderr.on('data', (err) => console.error('AI Error:', err));
-//     python.on('close', () => resolve('processed_frame_placeholder'));  // Fallback
-//   });
-// };
-
-// const { spawn } = require('child_process');
-// const path = require('path');
-
-// /**
-//  * Process frame with AI dehazing
-//  */
-// exports.processFrame = async (frameBase64, mode) => {
-//   return new Promise((resolve, reject) => {
-//     const script = mode === 'cloud' 
-//       ? path.join(__dirname, '..', '..', 'scripts', 'map_net.py')
-//       : path.join(__dirname, '..', '..', 'scripts', 'aod_net.py');
-
-//     console.log(`🤖 Processing frame with ${mode} mode`);
-
-//     // Remove data URI prefix if present
-//     const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-
-//     const python = spawn('python3', [script, cleanBase64]);
-
-//     let result = '';
-//     let errorOutput = '';
-
-//     python.stdout.on('data', (data) => {
-//       result += data.toString();
-//     });
-
-//     python.stderr.on('data', (data) => {
-//       errorOutput += data.toString();
-//       console.error('❌ Python error:', data.toString());
-//     });
-
-//     python.on('close', (code) => {
-//       if (code === 0 && result) {
-//         resolve(result.trim());
-//       } else {
-//         console.error(`❌ Python script exited with code ${code}`);
-//         // Fallback: return original frame if processing fails
-//         resolve(frameBase64);
-//       }
-//     });
-
-//     python.on('error', (error) => {
-//       console.error('❌ Failed to start Python process:', error);
-//       resolve(frameBase64); // Fallback
-//     });
-
-//     // Timeout after 5 seconds
-//     setTimeout(() => {
-//       python.kill();
-//       console.warn('⚠️ Processing timeout, returning original frame');
-//       resolve(frameBase64);
-//     }, 3000);
-//   });
-// };
-
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
 
 const processes = {
   cloud: null,
@@ -78,104 +12,150 @@ const resolvers = {
   local: []
 };
 
+// Use 'python' on Windows, 'python3' on macOS/Linux
+const PYTHON_CMD = os.platform() === 'win32' ? 'python' : 'python3';
+
+// Cloud mode: full DehazeFormer AI model (requires PyTorch + GPU-accelerated)
+const DEHAZEFORMER_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'dehazeformer_daemon.py');
+// Local mode: lightweight AOD-Net simulation (OpenCV only, no PyTorch needed)
+const AODNET_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'aod_net.py');
+
 function getScriptPath(mode) {
-  return mode === 'cloud'
-    ? path.join(__dirname, '..', '..', '..', 'scripts', 'dehazeformer_daemon.py')
-    : path.join(__dirname, '..', '..', '..', 'scripts', 'aod_net.py');
+  if (mode === 'local') {
+    return AODNET_SCRIPT;
+  }
+  return DEHAZEFORMER_SCRIPT;
 }
 
 function startProcess(mode) {
   if (processes[mode]) return;
 
   const script = getScriptPath(mode);
-  console.log(`🚀 Starting persistent AI daemon for ${mode} mode...`);
+  console.log(`Starting AI daemon for ${mode} mode: ${script}`);
+  console.log(`Using Python command: ${PYTHON_CMD}`);
 
-  const python = spawn('python3', ['-u', script]);
-  processes[mode] = python;
-
-  let buffer = '';
-  let stderrBuffer = '';
-
-  python.stdout.on('data', (data) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // Keep the last incomplete line in buffer
-
-    for (const line of lines) {
-      const resolve = resolvers[mode].shift();
-      if (resolve) {
-        resolve(line.trim());
-      }
-    }
-  });
-
-  python.stderr.on('data', (data) => {
-    const msg = data.toString();
-    stderrBuffer += msg;
-    console.error(`❌ AI Daemon (${mode}) Error:`, msg);
-  });
-
-  python.on('close', (code) => {
-    console.warn(`⚠️ AI Daemon (${mode}) exited with code ${code}. Stderr: ${stderrBuffer}`);
-    processes[mode] = null;
-
-    // Fail all pending requests for this mode
-    const pending = resolvers[mode];
-    resolvers[mode] = [];
-    pending.forEach(resolve => resolve(null));
-
-    // Auto-restart after 2s
-    setTimeout(() => startProcess(mode), 2000);
-  });
-
-  // Dummy write to initialize STDIN stream
   try {
-    python.stdin.write('\n');
-  } catch (e) {
-    console.error(`❌ Initial write to AI Daemon (${mode}) failed:`, e.message);
+    const python = spawn(PYTHON_CMD, ['-u', script], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    processes[mode] = python;
+
+    let buffer = '';
+
+    python.stdout.on('data', (data) => {
+      buffer += data.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // Keep the last incomplete line in buffer
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const resolve = resolvers[mode].shift();
+        if (resolve) {
+          resolve(trimmed);
+        }
+      }
+    });
+
+    python.stderr.on('data', (data) => {
+      // Log stderr but don't treat as fatal — model loading messages go here
+      console.log(`AI Daemon (${mode}):`, data.toString().trim());
+    });
+
+    python.on('close', (code) => {
+      console.warn(`AI Daemon (${mode}) exited with code ${code}`);
+      processes[mode] = null;
+
+      // Fail all pending requests for this mode
+      const pending = resolvers[mode];
+      resolvers[mode] = [];
+      pending.forEach(resolve => resolve(null));
+
+      // Auto-restart after 3s
+      setTimeout(() => {
+        console.log(`Auto-restarting AI daemon for ${mode} mode...`);
+        startProcess(mode);
+      }, 3000);
+    });
+
+    python.on('error', (err) => {
+      console.error(`Failed to start AI daemon (${mode}):`, err.message);
+      processes[mode] = null;
+
+      // Fail all pending
+      const pending = resolvers[mode];
+      resolvers[mode] = [];
+      pending.forEach(resolve => resolve(null));
+    });
+
+    // Dummy write to initialize STDIN stream
+    try {
+      python.stdin.write('\n');
+    } catch (e) {
+      console.error(`Initial write to AI Daemon (${mode}) failed:`, e.message);
+    }
+  } catch (err) {
+    console.error(`Failed to spawn AI daemon (${mode}):`, err.message);
   }
 }
 
 /**
- * Process frame with persistent AI dehazing
+ * Process a single base64-encoded frame through the AI dehazing daemon.
+ *
+ * How it works:
+ * 1. Writes the base64 frame string + newline to the daemon's stdin
+ * 2. The Python daemon decodes it, runs inference, encodes result back to base64
+ * 3. The daemon writes the result + newline to stdout
+ * 4. We read it here and resolve the promise
+ *
+ * Falls back to returning the original frame if the daemon is unavailable or times out.
  */
 exports.processFrame = async (frameBase64, mode) => {
   // Ensure daemon is running
   if (!processes[mode]) {
     startProcess(mode);
+    // Wait a moment for daemon to initialize on first call
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  if (!processes[mode]) {
+    console.warn(`AI Daemon (${mode}) not available, returning original frame`);
+    return frameBase64;
   }
 
   return new Promise((resolve) => {
     const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
 
     // Add to resolver queue
-    resolvers[mode].push((result) => {
-      resolve(result || frameBase64); // Fallback to original if daemon failed
-    });
+    const resolverFn = (result) => {
+      resolve(result || frameBase64);
+    };
+    resolvers[mode].push(resolverFn);
 
-    // Write to persistent stdin plus a newline for the Python loop
+    // Write frame to persistent daemon stdin
     try {
       processes[mode].stdin.write(cleanBase64 + '\n');
     } catch (e) {
-      console.error(`❌ Failed to write to AI Daemon (${mode}):`, e.message);
-      // Fallback
-      resolvers[mode].pop();
+      console.error(`Failed to write to AI Daemon (${mode}):`, e.message);
+      // Remove resolver and fallback
+      const idx = resolvers[mode].indexOf(resolverFn);
+      if (idx !== -1) resolvers[mode].splice(idx, 1);
       resolve(frameBase64);
     }
 
-    // Safety timeout in case daemon hangs
+    // Safety timeout — if daemon hangs, return original frame after 5s
     setTimeout(() => {
-      // Find and remove this resolver if it hasn't been called
-      const idx = resolvers[mode].findIndex(r => r === resolve);
+      const idx = resolvers[mode].indexOf(resolverFn);
       if (idx !== -1) {
         resolvers[mode].splice(idx, 1);
-        console.warn(`⚠️ AI Daemon (${mode}) timeout on frame, returning original`);
+        console.warn(`AI Daemon (${mode}) timeout on frame, returning original`);
         resolve(frameBase64);
       }
-    }, 2000);
+    }, 5000);
   });
 };
 
-// Pre-warm daemons
+// Pre-warm the cloud daemon on startup (local starts on first request)
+console.log('Pre-warming AI daemon (cloud mode)...');
 startProcess('cloud');
-startProcess('local');
