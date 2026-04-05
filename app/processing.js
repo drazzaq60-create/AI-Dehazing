@@ -102,7 +102,6 @@ export default function ProcessingScreen() {
           lastRenderRef.current = now;
 
           if (data.originalFrame) setHazyFrame(data.originalFrame);
-          if (data.originalFrame) setHazyFrame(data.originalFrame);
           if (data.processedFrame) setDehazedFrame(data.processedFrame);
 
           setSessionStats({

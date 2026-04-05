@@ -1,6 +1,16 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const http = require('http');
+const https = require('https');
+
+// ============================================
+// CONFIGURATION
+// ============================================
+
+// If COLAB_URL is set, cloud mode sends frames to Google Colab via HTTP.
+// If empty, cloud mode falls back to the local DehazeFormer Python daemon.
+const COLAB_URL = (process.env.COLAB_URL || '').replace(/\/+$/, ''); // trim trailing slashes
 
 const processes = {
   cloud: null,
@@ -21,11 +31,81 @@ const DEHAZEFORMER_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'd
 const AODNET_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'aod_net.py');
 
 function getScriptPath(mode) {
-  if (mode === 'local') {
-    return AODNET_SCRIPT;
-  }
-  return DEHAZEFORMER_SCRIPT;
+  return mode === 'local' ? AODNET_SCRIPT : DEHAZEFORMER_SCRIPT;
 }
+
+// ============================================
+// COLAB CLOUD PROCESSING (HTTP POST via ngrok)
+// ============================================
+
+/**
+ * Send a JSON POST request to the Colab server.
+ * Uses built-in http/https modules for maximum compatibility.
+ */
+function postJSON(url, body) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const lib = urlObj.protocol === 'https:' ? https : http;
+    const data = JSON.stringify(body);
+
+    const req = lib.request({
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        // ngrok free tier shows a browser warning page; this header skips it
+        'ngrok-skip-browser-warning': 'true'
+      },
+      timeout: 15000
+    }, (res) => {
+      let responseBody = '';
+      res.on('data', chunk => responseBody += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(responseBody));
+        } catch (e) {
+          reject(new Error(`Invalid JSON from Colab: ${responseBody.slice(0, 200)}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Colab request timed out (15s)'));
+    });
+
+    req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * Process a frame via the Google Colab server.
+ * Sends base64 frame as HTTP POST, receives dehazed base64 back.
+ */
+async function processFrameViaColab(frameBase64) {
+  const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+
+  try {
+    const result = await postJSON(`${COLAB_URL}/dehaze`, { frame: cleanBase64 });
+    if (result.dehazed) {
+      return result.dehazed;
+    }
+    console.warn('Colab returned no dehazed frame, using original');
+    return frameBase64;
+  } catch (error) {
+    console.error(`Colab processing error: ${error.message}`);
+    return frameBase64; // Fallback: return original frame
+  }
+}
+
+// ============================================
+// LOCAL DAEMON PROCESSING (stdin/stdout)
+// ============================================
 
 function startProcess(mode) {
   if (processes[mode]) return;
@@ -101,17 +181,9 @@ function startProcess(mode) {
 }
 
 /**
- * Process a single base64-encoded frame through the AI dehazing daemon.
- *
- * How it works:
- * 1. Writes the base64 frame string + newline to the daemon's stdin
- * 2. The Python daemon decodes it, runs inference, encodes result back to base64
- * 3. The daemon writes the result + newline to stdout
- * 4. We read it here and resolve the promise
- *
- * Falls back to returning the original frame if the daemon is unavailable or times out.
+ * Process a frame via a local Python daemon (stdin/stdout IPC).
  */
-exports.processFrame = async (frameBase64, mode) => {
+async function processFrameViaLocalDaemon(frameBase64, mode) {
   // Ensure daemon is running
   if (!processes[mode]) {
     startProcess(mode);
@@ -154,8 +226,55 @@ exports.processFrame = async (frameBase64, mode) => {
       }
     }, 5000);
   });
+}
+
+// ============================================
+// MAIN ENTRY POINT
+// ============================================
+
+/**
+ * Process a single base64-encoded frame through the AI dehazing pipeline.
+ *
+ * Cloud mode (PRIMARY):
+ *   - If COLAB_URL is set in .env → sends frame to Google Colab via HTTP POST (GPU-accelerated)
+ *   - If COLAB_URL is empty → falls back to local DehazeFormer Python daemon
+ *
+ * Local mode (COMING LATER — AOD-Net not yet trained):
+ *   - Will use the local AOD-Net daemon once training is complete
+ *   - For now, returns original frame with a warning
+ */
+exports.processFrame = async (frameBase64, mode) => {
+  // Cloud mode with Colab URL configured → use remote GPU (PRIMARY PATH)
+  if (mode === 'cloud' && COLAB_URL) {
+    return processFrameViaColab(frameBase64);
+  }
+
+  // Local mode — AOD-Net is not yet trained, return original frame for now
+  // Once AOD-Net training is done, this will use processFrameViaLocalDaemon()
+  if (mode === 'local') {
+    console.warn('Local mode (AOD-Net) is not yet available — model still being trained');
+    console.warn('Returning original frame. Switch to Cloud mode for AI dehazing.');
+    return frameBase64;
+  }
+
+  // Cloud mode without COLAB_URL — fall back to local DehazeFormer daemon
+  return processFrameViaLocalDaemon(frameBase64, mode);
 };
 
-// Pre-warm the cloud daemon on startup (local starts on first request)
-console.log('Pre-warming AI daemon (cloud mode)...');
-startProcess('cloud');
+// ============================================
+// STARTUP
+// ============================================
+if (COLAB_URL) {
+  console.log('='.repeat(50));
+  console.log(`Cloud mode (PRIMARY): Colab server at ${COLAB_URL}`);
+  console.log('Frames in cloud mode will be sent to Colab for GPU dehazing');
+  console.log('Local mode (AOD-Net): Not yet available — model still being trained');
+  console.log('='.repeat(50));
+  // No local daemon pre-warming — AOD-Net is not trained yet
+} else {
+  console.log('No COLAB_URL set — cloud mode will use local DehazeFormer daemon');
+  console.log('To use Colab GPU: set COLAB_URL in .env (see colab_server.ipynb)');
+  console.log('Local mode (AOD-Net): Not yet available — model still being trained');
+  console.log('Pre-warming AI daemon (cloud mode)...');
+  startProcess('cloud');
+}
