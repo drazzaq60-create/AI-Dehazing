@@ -21,6 +21,20 @@ const getWebSocketURL = () => {
 const WS_URL = getWebSocketURL();
 console.log('🔗 WebSocket URL configured:', WS_URL);
 
+// Derive HTTP base URL from the WebSocket URL (ws:// -> http://, wss:// -> https://)
+const getHttpBaseURL = (wsUrl) => {
+    try {
+        let base = wsUrl.replace(/^wss:\/\//, 'https://').replace(/^ws:\/\//, 'http://');
+        // Strip any trailing path
+        const match = base.match(/^(https?:\/\/[^/]+)/);
+        return match ? match[1] : base;
+    } catch (_) {
+        return wsUrl;
+    }
+};
+
+const HTTP_BASE_URL = getHttpBaseURL(WS_URL);
+
 // 2. WEBSOCKET SERVICE CLASS
 class WebSocketService {
     constructor() {
@@ -54,6 +68,31 @@ class WebSocketService {
                         return;
                     }
                     const data = JSON.parse(event.data);
+
+                    // Dispatch type-specific events in addition to generic 'message'
+                    switch (data.type) {
+                        case 'dehazed_frame':
+                            this.emit('dehazedFrame', data);
+                            break;
+                        case 'mode_switched':
+                            this.emit('modeSwitched', {
+                                mode: data.mode,
+                                reason: data.reason,
+                                timestamp: data.timestamp
+                            });
+                            break;
+                        case 'download_ready':
+                            this.emit('downloadReady', {
+                                path: data.path,
+                                duration: data.duration,
+                                sessionId: data.sessionId
+                            });
+                            break;
+                        default:
+                            break;
+                    }
+
+                    // Always emit generic message for backward compatibility
                     this.emit('message', data);
                 } catch (error) {
                     console.error('❌ Error parsing message:', error);
@@ -121,7 +160,7 @@ class WebSocketService {
 }
 
 const wsService = new WebSocketService();
-export { WS_URL, wsService };
+export { HTTP_BASE_URL, WS_URL, wsService };
 
 // 3. APP CONTEXT
 const AppContext = createContext(undefined);

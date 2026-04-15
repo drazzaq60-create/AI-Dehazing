@@ -4,17 +4,20 @@ import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  Animated,
   Dimensions,
   Image,
+  Linking,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View
 } from 'react-native';
 import { Camera, useCameraDevice, useCameraFormat, useCameraPermission } from 'react-native-vision-camera';
-import { useAppContext } from './_layout';
+import { HTTP_BASE_URL, useAppContext } from './_layout';
 
 const { width } = Dimensions.get('window');
 const FRAME_WIDTH = (width - 48) / 2;
@@ -25,6 +28,9 @@ export default function ProcessingScreen() {
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [mode, setMode] = useState('cloud');
+  const [autoMode, setAutoMode] = useState(null);
+  const [autoModeTimestamp, setAutoModeTimestamp] = useState(0);
+  const [userModeTimestamp, setUserModeTimestamp] = useState(0);
   const [hazyFrame, setHazyFrame] = useState(null);
   const [dehazedFrame, setDehazedFrame] = useState(null);
   const [sessionStats, setSessionStats] = useState({ frameCount: 0, fps: 0, delay: 0 });
@@ -32,11 +38,25 @@ export default function ProcessingScreen() {
   const [status, setStatus] = useState('Ready');
   const [videoUrl, setVideoUrl] = useState(null);
 
+  // Mode switch banner
+  const [banner, setBanner] = useState(null);
+  const bannerOpacity = useRef(new Animated.Value(0)).current;
+  const bannerHideTimerRef = useRef(null);
+
+  // Clip picker
+  const [showClipPicker, setShowClipPicker] = useState(false);
+  const [startSecInput, setStartSecInput] = useState('0');
+  const [endSecInput, setEndSecInput] = useState('5');
+  const [clipError, setClipError] = useState(null);
+
   const sessionIdRef = useRef(null);
   const wasStopClickedRef = useRef(false);
   const lastRenderRef = useRef(0);
   const startTimeRef = useRef(null);
   const pendingBinaryMetaRef = useRef(null);
+
+  // Effective mode — most recently updated between user pick & server auto
+  const effectiveMode = autoMode && autoModeTimestamp > userModeTimestamp ? autoMode : mode;
 
   // Sync mode changes to server during active processing
   useEffect(() => {
@@ -49,6 +69,54 @@ export default function ProcessingScreen() {
       });
     }
   }, [mode]);
+
+  // Pick mode manually (tracks timestamp so effectiveMode picks latest)
+  const pickMode = (m) => {
+    setMode(m);
+    setUserModeTimestamp(Date.now());
+  };
+
+  const showBanner = (text) => {
+    setBanner(text);
+    Animated.timing(bannerOpacity, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    if (bannerHideTimerRef.current) clearTimeout(bannerHideTimerRef.current);
+    bannerHideTimerRef.current = setTimeout(() => {
+      Animated.timing(bannerOpacity, { toValue: 0, duration: 500, useNativeDriver: true })
+        .start(() => setBanner(null));
+    }, 4000);
+  };
+
+  // Listen for server-driven modeSwitched and downloadReady events
+  useEffect(() => {
+    if (!wsService) return;
+
+    const handleModeSwitched = ({ mode: newMode, reason }) => {
+      setAutoMode(newMode);
+      setAutoModeTimestamp(Date.now());
+      const label = (newMode || '').toUpperCase();
+      showBanner(`Switched to ${label} mode${reason ? ` (${reason})` : ''}`);
+    };
+
+    const handleDownloadReady = ({ path, duration, sessionId: sid }) => {
+      const url = `${HTTP_BASE_URL}${path}`;
+      console.log('📥 Download ready:', url);
+      setStatus(`Clip ready (${duration ?? '?'}s). Opening download...`);
+      setVideoUrl(path);
+      Linking.openURL(url).catch((err) => {
+        console.error('Linking error:', err);
+        Alert.alert('Error', 'Could not open download URL');
+      });
+    };
+
+    wsService.on('modeSwitched', handleModeSwitched);
+    wsService.on('downloadReady', handleDownloadReady);
+
+    return () => {
+      wsService.off('modeSwitched', handleModeSwitched);
+      wsService.off('downloadReady', handleDownloadReady);
+      if (bannerHideTimerRef.current) clearTimeout(bannerHideTimerRef.current);
+    };
+  }, [wsService]);
 
   // Vision Camera refs & hooks
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -165,6 +233,10 @@ export default function ProcessingScreen() {
     setSessionStats({ frameCount: 0, fps: 0, delay: 0 });
     setHazyFrame(null);
     setDehazedFrame(null);
+    startTimeRef.current = Date.now();
+    setAutoMode(null);
+    setAutoModeTimestamp(0);
+    setUserModeTimestamp(Date.now());
 
     wsService.send({
       type: 'start_processing',
@@ -175,6 +247,53 @@ export default function ProcessingScreen() {
 
     setStatus('Initializing session...');
     setVideoUrl(null); // Reset previous video link
+  };
+
+  // Estimate current session duration in seconds (from startTimeRef)
+  const getSessionDurationSec = () => {
+    if (!startTimeRef.current) return 0;
+    return Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000));
+  };
+
+  // Send download_clip request after validating the time range
+  const requestClipDownload = () => {
+    const startSec = parseFloat(startSecInput);
+    const endSec = parseFloat(endSecInput);
+    const duration = getSessionDurationSec();
+
+    if (isNaN(startSec) || isNaN(endSec)) {
+      setClipError('Start and end must be numbers');
+      return;
+    }
+    if (startSec < 0) {
+      setClipError('Start must be >= 0');
+      return;
+    }
+    if (startSec >= endSec) {
+      setClipError('Start must be < end');
+      return;
+    }
+    if (duration > 0 && endSec > duration) {
+      setClipError(`End must be <= ${duration}s (session length)`);
+      return;
+    }
+
+    setClipError(null);
+    const sid = sessionIdRef.current || sessionId;
+    if (!sid) {
+      setClipError('No active session');
+      return;
+    }
+
+    wsService.send({
+      type: 'download_clip',
+      sessionId: sid,
+      startSec,
+      endSec,
+      fps: 20
+    });
+    setStatus(`Requesting clip ${startSec}s - ${endSec}s...`);
+    setShowClipPicker(false);
   };
 
   // Dedicated capture loop for the Processing screen
@@ -287,8 +406,7 @@ export default function ProcessingScreen() {
     try {
       setStatus('Downloading video...');
 
-      const API_URL = wsService.ws.url.replace('ws://', 'http://').replace('wss://', 'https://');
-      const downloadLink = `${API_URL}${videoUrl}`;
+      const downloadLink = `${HTTP_BASE_URL}${videoUrl}`;
 
       console.log('🔗 Downloading from:', downloadLink);
 
@@ -341,18 +459,25 @@ export default function ProcessingScreen() {
       {/* Mode Selector */}
       <View style={styles.modeSelector}>
         <TouchableOpacity
-          style={[styles.modeButton, mode === 'cloud' && styles.modeActive]}
-          onPress={() => setMode('cloud')}
+          style={[styles.modeButton, effectiveMode === 'cloud' && styles.modeActive]}
+          onPress={() => pickMode('cloud')}
         >
           <Text style={styles.modeText}>☁️ Cloud (Fast)</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.modeButton, mode === 'local' && styles.modeActive]}
-          onPress={() => setMode('local')}
+          style={[styles.modeButton, effectiveMode === 'local' && styles.modeActive]}
+          onPress={() => pickMode('local')}
         >
           <Text style={styles.modeText}>💻 Local (Quality)</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Mode switch banner */}
+      {banner && (
+        <Animated.View style={[styles.banner, { opacity: bannerOpacity }]}>
+          <Text style={styles.bannerText}>{banner}</Text>
+        </Animated.View>
+      )}
 
       {/* Side-by-Side Comparison */}
       <View style={styles.comparisonContainer}>
@@ -411,7 +536,7 @@ export default function ProcessingScreen() {
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Mode</Text>
-            <Text style={styles.statValue}>{mode === 'cloud' ? '☁️' : '💻'}</Text>
+            <Text style={styles.statValue}>{effectiveMode === 'cloud' ? '☁️' : '💻'}</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Status</Text>
@@ -445,12 +570,58 @@ export default function ProcessingScreen() {
           </TouchableOpacity>
         )}
 
-        {videoUrl && (
+        {(isProcessing || sessionIdRef.current) && (
           <TouchableOpacity
             style={[styles.primaryButton, { backgroundColor: '#3b82f6', marginTop: 10 }]}
+            onPress={() => {
+              setClipError(null);
+              const dur = getSessionDurationSec();
+              if (dur > 0 && parseFloat(endSecInput) > dur) setEndSecInput(String(dur));
+              setShowClipPicker((v) => !v);
+            }}
+          >
+            <Text style={styles.buttonText}>⬇️ Download Clip (Pick Range)</Text>
+          </TouchableOpacity>
+        )}
+
+        {showClipPicker && (
+          <View style={styles.clipPicker}>
+            <Text style={styles.clipPickerTitle}>
+              Pick time range (seconds) — session: {getSessionDurationSec()}s
+            </Text>
+            <View style={styles.clipRow}>
+              <Text style={styles.clipLabel}>Start</Text>
+              <TextInput
+                style={styles.clipInput}
+                keyboardType="numeric"
+                value={startSecInput}
+                onChangeText={setStartSecInput}
+                placeholder="0"
+                placeholderTextColor="#64748b"
+              />
+              <Text style={styles.clipLabel}>End</Text>
+              <TextInput
+                style={styles.clipInput}
+                keyboardType="numeric"
+                value={endSecInput}
+                onChangeText={setEndSecInput}
+                placeholder="5"
+                placeholderTextColor="#64748b"
+              />
+            </View>
+            {clipError && <Text style={styles.clipError}>{clipError}</Text>}
+            <TouchableOpacity style={styles.clipConfirm} onPress={requestClipDownload}>
+              <Text style={styles.buttonText}>Confirm & Download</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {videoUrl && !showClipPicker && (
+          <TouchableOpacity
+            style={[styles.primaryButton, { backgroundColor: '#2563eb', marginTop: 6 }]}
             onPress={downloadVideo}
           >
-            <Text style={styles.buttonText}>⬇️ Download Dehazed MP4</Text>
+            <Text style={styles.buttonText}>⬇️ Download Last MP4</Text>
           </TouchableOpacity>
         )}
 
@@ -652,5 +823,65 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  banner: {
+    marginHorizontal: 16,
+    marginBottom: 8,
+    padding: 12,
+    backgroundColor: '#f59e0b',
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  bannerText: {
+    color: '#1e293b',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
+  clipPicker: {
+    backgroundColor: '#1e293b',
+    padding: 12,
+    borderRadius: 12,
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  clipPickerTitle: {
+    color: '#e2e8f0',
+    fontSize: 12,
+    marginBottom: 10,
+    fontWeight: '600',
+  },
+  clipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  clipLabel: {
+    color: '#94a3b8',
+    fontSize: 12,
+    width: 36,
+  },
+  clipInput: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+    color: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#334155',
+    fontSize: 14,
+  },
+  clipError: {
+    color: '#f87171',
+    fontSize: 12,
+    marginTop: 8,
+  },
+  clipConfirm: {
+    marginTop: 10,
+    backgroundColor: '#22c55e',
+    padding: 12,
+    borderRadius: 10,
+    alignItems: 'center',
   },
 });

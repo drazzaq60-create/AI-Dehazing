@@ -22,6 +22,24 @@ function initWebSocket(server) {
 
   wss = new WebSocket.Server({ server });
 
+  // Broadcast automatic mode switches (from aiService auto-toggle logic)
+  // to every connected client so the app can update its status indicator.
+  aiService.on('modeSwitch', ({ mode, reason }) => {
+    const payload = JSON.stringify({
+      type: 'mode_switched',
+      mode,
+      newMode: mode,      // alias — legacy clients read `newMode`
+      reason,
+      automatic: true,
+      timestamp: Date.now()
+    });
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    });
+  });
+
   wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
     console.log(`WebSocket client connected from ${clientIp}`);
@@ -153,9 +171,15 @@ async function handleVideoFrame(ws, data) {
     const mode = switchingService.getMode(userId) || 'cloud';
     const startTime = Date.now();
 
-    // >>> KEY INTEGRATION: send frame to Python AI daemon, get dehazed frame back
-    const processedFrame = await aiService.processFrame(frame, mode);
+    // >>> KEY INTEGRATION: send frame to AI pipeline (Colab cloud or local AOD-Net)
+    const result = await aiService.processFrame(frame, mode);
     const processingTime = Date.now() - startTime;
+
+    // aiService now returns { frame, mode, ms, error? } — unwrap for downstream use
+    const processedFrame =
+      (result && typeof result === 'object') ? result.frame : (result || frame);
+    const actualMode = (result && result.mode) || mode;
+    const modelMs = (result && typeof result.ms === 'number') ? result.ms : processingTime;
 
     // Update session stats
     if (session) {
@@ -178,14 +202,27 @@ async function handleVideoFrame(ws, data) {
       }
     }
 
-    // Frontend (processing.js) expects 'processed_frame' with these exact fields
+    // Frontend (processing.js) expects 'processed_frame' with these exact fields;
+    // we also emit guide §7-style `dehazed_frame` so new clients can use either.
+    const frameIndex = session ? session.frameCount : frameNumber;
     ws.send(JSON.stringify({
       type: 'processed_frame',
       originalFrame: frame,
       processedFrame: processedFrame || frame,
-      frameCount: session ? session.frameCount : frameNumber,
+      frameCount: frameIndex,
       fps: parseFloat(fps.toFixed(1)),
       processingTime,
+      mode: actualMode,
+      ms: modelMs,
+      sessionId
+    }));
+
+    ws.send(JSON.stringify({
+      type: 'dehazed_frame',
+      frame: processedFrame || frame,
+      mode: actualMode,
+      frameIndex,
+      ms: modelMs,
       sessionId
     }));
 

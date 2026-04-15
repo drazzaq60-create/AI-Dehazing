@@ -1,99 +1,152 @@
-# # import sys
-# # frame = sys.argv[1]
-# # print("dehazed_local_frame_placeholder")  # Simulate AOD-Net output
-
-# import sys
-
-# # FIX: Read the Base64 data from stdin, not sys.argv[1]
-# frame = sys.stdin.read().strip()
-
-# # Check if data was received (good practice)
-# if not frame:
-#     sys.stderr.write("Error: AOD-Net received no data from stdin.\n")
-#     sys.exit(1)
-
-# # TODO: Add your actual AOD-Net processing logic here
-
-# print("dehazed_local_frame_placeholder")  # Simulate AOD-Net output
-
-
-import cv2
-import numpy as np
-import base64
+"""
+AOD-Net Local Fallback Daemon
+- Reads base64-encoded JPEG frames from stdin (one per line)
+- Outputs dehazed base64-encoded JPEG frames to stdout (one per line)
+- Runs forever until killed by parent process (Node.js backend)
+- No GPU required - CPU only, ~30ms per frame at 320x240
+- On any failure (bad weights, bad frame, etc.) returns the ORIGINAL
+  frame so the backend pipeline never blocks or crashes.
+"""
 import sys
-import time
+import os
+import cv2
+import base64
+import argparse
+import traceback
+import numpy as np
+import torch
+import torch.nn as nn
 
-def simulate_aod_net(frame):
-    """Simulate AOD-Net dehazing (replace with actual model)"""
-    # Convert to float32 for processing
-    frame_float = frame.astype(np.float32) / 255.0
-    
-    # Simulate atmospheric light estimation (simplified)
-    dark_channel = cv2.erode(np.min(frame_float, axis=2), np.ones((15, 15), np.uint8))
-    atmospheric_light = np.percentile(dark_channel, 99.9)
-    
-    # Simulate transmission map
-    transmission = 1 - 0.95 * dark_channel / max(atmospheric_light, 0.1)
-    transmission = np.clip(transmission, 0.1, 0.9)
-    
-    # Recover scene radiance
-    result = np.zeros_like(frame_float)
-    for i in range(3):
-        result[:, :, i] = (frame_float[:, :, i] - atmospheric_light) / transmission + atmospheric_light
-    
-    # Clip and convert back
-    result = np.clip(result * 255, 0, 255).astype(np.uint8)
-    
-    # Add some contrast enhancement
-    result = cv2.convertScaleAbs(result, alpha=1.2, beta=10)
-    
-    return result
 
-def dehaze_frame(frame_base64):
-    """Main dehazing function"""
+class AODNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relu    = nn.ReLU(inplace=True)
+        self.e_conv1 = nn.Conv2d(3,  3,  1, padding=0)
+        self.e_conv2 = nn.Conv2d(3,  3,  3, padding=1)
+        self.e_conv3 = nn.Conv2d(6,  3,  5, padding=2)
+        self.e_conv4 = nn.Conv2d(6,  3,  7, padding=3)
+        self.e_conv5 = nn.Conv2d(12, 3,  3, padding=1)
+
+    def forward(self, x):
+        x1 = self.relu(self.e_conv1(x))
+        x2 = self.relu(self.e_conv2(x1))
+        x3 = self.relu(self.e_conv3(torch.cat([x1, x2], 1)))
+        x4 = self.relu(self.e_conv4(torch.cat([x2, x3], 1)))
+        k  = self.relu(self.e_conv5(torch.cat([x1, x2, x3, x4], 1)))
+        return torch.clamp(k * x - k + 1, 0, 1)
+
+
+def fix_colors(img_bgr):
+    img = img_bgr.astype(np.float32)
+    for c in range(3):
+        lo = np.percentile(img[:, :, c], 1)
+        hi = np.percentile(img[:, :, c], 99)
+        img[:, :, c] = np.clip((img[:, :, c] - lo) / (hi - lo + 1e-6), 0, 1) * 255
+    img[:, :, 2] = np.clip(img[:, :, 2] * 1.05, 0, 255)  # Red  +5%
+    img[:, :, 0] = np.clip(img[:, :, 0] * 0.97, 0, 255)  # Blue -3%
+    return img.astype(np.uint8)
+
+
+def _extract_state_dict(ckpt):
+    """Accept a checkpoint object in several known shapes and return a flat state_dict."""
+    if isinstance(ckpt, dict):
+        for key in ('model', 'state_dict', 'net', 'network'):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
+        # Heuristic: if every value is a tensor, treat the dict itself as the state_dict.
+        if all(hasattr(v, 'shape') for v in ckpt.values()):
+            return ckpt
+    # Fall back - caller will handle the error
+    return ckpt
+
+
+def _strip_module_prefix(state):
+    if not isinstance(state, dict):
+        return state
+    return {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state.items()}
+
+
+def load_weights(model, weights_path):
+    """Try to populate model with trained weights. Returns True on success."""
+    if not os.path.exists(weights_path):
+        sys.stderr.write(f"[AOD-Net] WARNING: weights not found at {weights_path}\n")
+        sys.stderr.flush()
+        return False
     try:
-        # Decode base64
-        frame_data = base64.b64decode(frame_base64)
-        nparr = np.frombuffer(frame_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            print("Error: Could not decode image", file=sys.stderr)
-            return frame_base64
-        
-        # Process with simulated AOD-Net
-        processed = simulate_aod_net(frame)
-        
-        # Apply additional enhancements
-        processed = cv2.fastNlMeansDenoisingColored(processed, None, 10, 10, 7, 21)
-        
-        # Encode back to base64
-        _, buffer = cv2.imencode('.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return base64.b64encode(buffer).decode('utf-8')
-        
+        ckpt = torch.load(weights_path, map_location='cpu', weights_only=False)
+        state = _extract_state_dict(ckpt)
+        state = _strip_module_prefix(state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        sys.stderr.write(f"[AOD-Net] Loaded: {weights_path}\n")
+        if missing:
+            sys.stderr.write(f"[AOD-Net] Missing keys: {list(missing)[:8]}\n")
+        if unexpected:
+            sys.stderr.write(f"[AOD-Net] Unexpected keys: {list(unexpected)[:8]}\n")
+        sys.stderr.flush()
+        return True
     except Exception as e:
-        print(f"Error in AOD-Net: {e}", file=sys.stderr)
-        return frame_base64
+        sys.stderr.write(f"[AOD-Net] ERROR loading weights: {e}\n")
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
+        return False
 
-if __name__ == "__main__":
-    # Persistent loop for real-time processing
-    # Blocks until a new base64 line is received
-    while True:
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--weights', default='scripts/real_dehaze/aodnet_best')
+    args = parser.parse_args()
+
+    model = AODNet().eval()
+    weights_loaded = load_weights(model, args.weights)
+    if not weights_loaded:
+        sys.stderr.write("[AOD-Net] Running WITHOUT trained weights - frames will pass through.\n")
+        sys.stderr.flush()
+
+    sys.stderr.write("[AOD-Net] Ready. Listening on stdin...\n")
+    sys.stderr.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
         try:
-            line = sys.stdin.readline()
-            if not line:
-                # Actual EOF
-                break
-            
-            input_data = line.strip()
-            if not input_data:
+            raw = base64.b64decode(line)
+            nparr = np.frombuffer(raw, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is None:
+                raise ValueError("cv2.imdecode returned None")
+
+            if not weights_loaded:
+                # Graceful degradation: return original frame re-encoded
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                sys.stdout.write(base64.b64encode(buf).decode('utf-8') + '\n')
+                sys.stdout.flush()
                 continue
-                
-            result = dehaze_frame(input_data)
-            sys.stdout.write(result + "\n")
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            inp = torch.from_numpy(rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
+            with torch.no_grad():
+                out = model(inp).squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
+            clean = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+            clean = fix_colors(clean)
+
+            _, buf = cv2.imencode('.jpg', clean, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            sys.stdout.write(base64.b64encode(buf).decode('utf-8') + '\n')
             sys.stdout.flush()
-        except EOFError:
-            break
+
         except Exception as e:
-            sys.stderr.write(f"Error in daemon loop: {e}\n")
+            sys.stderr.write(f"[AOD-Net] Frame error: {e}\n")
             sys.stderr.flush()
+            # Never crash, never block - echo the ORIGINAL base64 back
+            try:
+                sys.stdout.write(line + '\n')
+                sys.stdout.flush()
+            except Exception as ee:
+                sys.stderr.write(f"[AOD-Net] Failed to echo original frame: {ee}\n")
+                sys.stderr.flush()
+
+
+if __name__ == '__main__':
+    main()

@@ -3,46 +3,23 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const https = require('https');
+const EventEmitter = require('events');
 
 // ============================================
 // CONFIGURATION
 // ============================================
 
-// If COLAB_URL is set, cloud mode sends frames to Google Colab via HTTP.
-// If empty, cloud mode falls back to the local DehazeFormer Python daemon.
-const COLAB_URL = (process.env.COLAB_URL || '').replace(/\/+$/, ''); // trim trailing slashes
-
-const processes = {
-  cloud: null,
-  local: null
-};
-
-const resolvers = {
-  cloud: [],
-  local: []
-};
-
-// Use 'python' on Windows, 'python3' on macOS/Linux
 const PYTHON_CMD = os.platform() === 'win32' ? 'python' : 'python3';
 
-// Cloud mode: full DehazeFormer AI model (requires PyTorch + GPU-accelerated)
-const DEHAZEFORMER_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'dehazeformer_daemon.py');
-// Local mode: lightweight AOD-Net simulation (OpenCV only, no PyTorch needed)
+// Local AOD-Net fallback daemon (CPU, always available)
 const AODNET_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'aod_net.py');
-
-function getScriptPath(mode) {
-  return mode === 'local' ? AODNET_SCRIPT : DEHAZEFORMER_SCRIPT;
-}
+// Weights path — guide §4 specifies `scripts/real_dehaze/aodnet_best` (directory form).
+const AODNET_WEIGHTS = path.join(__dirname, '..', '..', '..', 'scripts', 'real_dehaze', 'aodnet_best');
 
 // ============================================
-// COLAB CLOUD PROCESSING (HTTP POST via ngrok)
+// HTTP POST HELPER (with timeout + abort)
 // ============================================
-
-/**
- * Send a JSON POST request to the Colab server.
- * Uses built-in http/https modules for maximum compatibility.
- */
-function postJSON(url, body) {
+function postJSON(url, body, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const lib = urlObj.protocol === 'https:' ? https : http;
@@ -56,10 +33,9 @@ function postJSON(url, body) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
-        // ngrok free tier shows a browser warning page; this header skips it
         'ngrok-skip-browser-warning': 'true'
       },
-      timeout: 15000
+      timeout: timeoutMs
     }, (res) => {
       let responseBody = '';
       res.on('data', chunk => responseBody += chunk);
@@ -67,15 +43,19 @@ function postJSON(url, body) {
         try {
           resolve(JSON.parse(responseBody));
         } catch (e) {
-          reject(new Error(`Invalid JSON from Colab: ${responseBody.slice(0, 200)}`));
+          const err = new Error(`Invalid JSON from Colab: ${responseBody.slice(0, 200)}`);
+          err.name = 'InvalidJSONError';
+          reject(err);
         }
       });
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => reject(err));
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error('Colab request timed out (15s)'));
+      const err = new Error('Colab request timed out');
+      err.name = 'AbortError';
+      reject(err);
     });
 
     req.write(data);
@@ -83,198 +63,285 @@ function postJSON(url, body) {
   });
 }
 
-/**
- * Process a frame via the Google Colab server.
- * Sends base64 frame as HTTP POST, receives dehazed base64 back.
- */
-async function processFrameViaColab(frameBase64) {
-  const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+function getJSON(url, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const lib = urlObj.protocol === 'https:' ? https : http;
 
-  try {
-    const result = await postJSON(`${COLAB_URL}/dehaze`, { frame: cleanBase64 });
-    if (result.dehazed) {
-      return result.dehazed;
-    }
-    console.warn('Colab returned no dehazed frame, using original');
-    return frameBase64;
-  } catch (error) {
-    console.error(`Colab processing error: ${error.message}`);
-    return frameBase64; // Fallback: return original frame
-  }
-}
-
-// ============================================
-// LOCAL DAEMON PROCESSING (stdin/stdout)
-// ============================================
-
-function startProcess(mode) {
-  if (processes[mode]) return;
-
-  const script = getScriptPath(mode);
-  console.log(`Starting AI daemon for ${mode} mode: ${script}`);
-  console.log(`Using Python command: ${PYTHON_CMD}`);
-
-  try {
-    const python = spawn(PYTHON_CMD, ['-u', script], {
-      stdio: ['pipe', 'pipe', 'pipe']
+    const req = lib.request({
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname,
+      method: 'GET',
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+      timeout: timeoutMs
+    }, (res) => {
+      let responseBody = '';
+      res.on('data', chunk => responseBody += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body: responseBody }));
     });
 
-    processes[mode] = python;
-
-    let buffer = '';
-
-    python.stdout.on('data', (data) => {
-      buffer += data.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // Keep the last incomplete line in buffer
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const resolve = resolvers[mode].shift();
-        if (resolve) {
-          resolve(trimmed);
-        }
-      }
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      const err = new Error('Health check timed out');
+      err.name = 'AbortError';
+      reject(err);
     });
-
-    python.stderr.on('data', (data) => {
-      // Log stderr but don't treat as fatal — model loading messages go here
-      console.log(`AI Daemon (${mode}):`, data.toString().trim());
-    });
-
-    python.on('close', (code) => {
-      console.warn(`AI Daemon (${mode}) exited with code ${code}`);
-      processes[mode] = null;
-
-      // Fail all pending requests for this mode
-      const pending = resolvers[mode];
-      resolvers[mode] = [];
-      pending.forEach(resolve => resolve(null));
-
-      // Auto-restart after 3s
-      setTimeout(() => {
-        console.log(`Auto-restarting AI daemon for ${mode} mode...`);
-        startProcess(mode);
-      }, 3000);
-    });
-
-    python.on('error', (err) => {
-      console.error(`Failed to start AI daemon (${mode}):`, err.message);
-      processes[mode] = null;
-
-      // Fail all pending
-      const pending = resolvers[mode];
-      resolvers[mode] = [];
-      pending.forEach(resolve => resolve(null));
-    });
-
-    // Dummy write to initialize STDIN stream
-    try {
-      python.stdin.write('\n');
-    } catch (e) {
-      console.error(`Initial write to AI Daemon (${mode}) failed:`, e.message);
-    }
-  } catch (err) {
-    console.error(`Failed to spawn AI daemon (${mode}):`, err.message);
-  }
-}
-
-/**
- * Process a frame via a local Python daemon (stdin/stdout IPC).
- */
-async function processFrameViaLocalDaemon(frameBase64, mode) {
-  // Ensure daemon is running
-  if (!processes[mode]) {
-    startProcess(mode);
-    // Wait a moment for daemon to initialize on first call
-    await new Promise(r => setTimeout(r, 500));
-  }
-
-  if (!processes[mode]) {
-    console.warn(`AI Daemon (${mode}) not available, returning original frame`);
-    return frameBase64;
-  }
-
-  return new Promise((resolve) => {
-    const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-
-    // Add to resolver queue
-    const resolverFn = (result) => {
-      resolve(result || frameBase64);
-    };
-    resolvers[mode].push(resolverFn);
-
-    // Write frame to persistent daemon stdin
-    try {
-      processes[mode].stdin.write(cleanBase64 + '\n');
-    } catch (e) {
-      console.error(`Failed to write to AI Daemon (${mode}):`, e.message);
-      // Remove resolver and fallback
-      const idx = resolvers[mode].indexOf(resolverFn);
-      if (idx !== -1) resolvers[mode].splice(idx, 1);
-      resolve(frameBase64);
-    }
-
-    // Safety timeout — if daemon hangs, return original frame after 5s
-    setTimeout(() => {
-      const idx = resolvers[mode].indexOf(resolverFn);
-      if (idx !== -1) {
-        resolvers[mode].splice(idx, 1);
-        console.warn(`AI Daemon (${mode}) timeout on frame, returning original`);
-        resolve(frameBase64);
-      }
-    }, 5000);
+    req.end();
   });
 }
 
 // ============================================
-// MAIN ENTRY POINT
+// AIService — EventEmitter with auto-toggle logic
 // ============================================
+class AIService extends EventEmitter {
+  constructor() {
+    super();
 
-/**
- * Process a single base64-encoded frame through the AI dehazing pipeline.
- *
- * Cloud mode (PRIMARY):
- *   - If COLAB_URL is set in .env → sends frame to Google Colab via HTTP POST (GPU-accelerated)
- *   - If COLAB_URL is empty → falls back to local DehazeFormer Python daemon
- *
- * Local mode (COMING LATER — AOD-Net not yet trained):
- *   - Will use the local AOD-Net daemon once training is complete
- *   - For now, returns original frame with a warning
- */
-exports.processFrame = async (frameBase64, mode) => {
-  // Cloud mode with Colab URL configured → use remote GPU (PRIMARY PATH)
-  if (mode === 'cloud' && COLAB_URL) {
-    return processFrameViaColab(frameBase64);
+    this.mode = 'cloud';              // 'cloud' | 'local'
+    this.consecutiveSlowFrames = 0;
+    this.consecutiveFastFrames = 0;
+
+    this.SLOW_THRESHOLD_MS = 7000;
+    this.FAST_THRESHOLD_MS = 3000;
+    this.SLOW_COUNT_LIMIT = 3;
+    this.FAST_COUNT_LIMIT = 5;
+
+    this.colabUrl = (process.env.COLAB_URL || '').replace(/\/+$/, '') || null;
+
+    // AOD daemon plumbing (queue-based stdout parsing preserved from legacy impl)
+    this.aodProcess = null;
+    this._aodResolvers = [];
+    this._aodStdoutBuffer = '';
+    this._recoveryInFlight = false;
+
+    this._spawnAODDaemon();
+    this._logStartup();
   }
 
-  // Local mode — AOD-Net is not yet trained, return original frame for now
-  // Once AOD-Net training is done, this will use processFrameViaLocalDaemon()
-  if (mode === 'local') {
-    console.warn('Local mode (AOD-Net) is not yet available — model still being trained');
-    console.warn('Returning original frame. Switch to Cloud mode for AI dehazing.');
-    return frameBase64;
+  _logStartup() {
+    console.log('='.repeat(50));
+    if (this.colabUrl) {
+      console.log(`[AIService] Cloud: Colab @ ${this.colabUrl}`);
+    } else {
+      console.log('[AIService] Cloud: disabled (COLAB_URL empty) — local AOD-Net only');
+      this.mode = 'local';
+    }
+    console.log(`[AIService] Local: AOD-Net daemon (${AODNET_SCRIPT})`);
+    console.log('='.repeat(50));
   }
 
-  // Cloud mode without COLAB_URL — fall back to local DehazeFormer daemon
-  return processFrameViaLocalDaemon(frameBase64, mode);
-};
+  // --------------------------------------------
+  // AOD-Net daemon lifecycle
+  // --------------------------------------------
+  _spawnAODDaemon() {
+    if (this.aodProcess) return;
 
-// ============================================
-// STARTUP
-// ============================================
-if (COLAB_URL) {
-  console.log('='.repeat(50));
-  console.log(`Cloud mode (PRIMARY): Colab server at ${COLAB_URL}`);
-  console.log('Frames in cloud mode will be sent to Colab for GPU dehazing');
-  console.log('Local mode (AOD-Net): Not yet available — model still being trained');
-  console.log('='.repeat(50));
-  // No local daemon pre-warming — AOD-Net is not trained yet
-} else {
-  console.log('No COLAB_URL set — cloud mode will use local DehazeFormer daemon');
-  console.log('To use Colab GPU: set COLAB_URL in .env (see colab_server.ipynb)');
-  console.log('Local mode (AOD-Net): Not yet available — model still being trained');
-  console.log('Pre-warming AI daemon (cloud mode)...');
-  startProcess('cloud');
+    try {
+      this.aodProcess = spawn(PYTHON_CMD, [
+        '-u',
+        AODNET_SCRIPT,
+        '--weights', AODNET_WEIGHTS
+      ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      console.error('[AOD-Net] Failed to spawn:', err.message);
+      this.aodProcess = null;
+      return;
+    }
+
+    this.aodProcess.stdout.on('data', (data) => {
+      this._aodStdoutBuffer += data.toString();
+      const lines = this._aodStdoutBuffer.split('\n');
+      this._aodStdoutBuffer = lines.pop();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const resolver = this._aodResolvers.shift();
+        if (resolver) resolver(trimmed);
+      }
+    });
+
+    this.aodProcess.stderr.on('data', (d) => {
+      console.log('[AOD-Net]', d.toString().trim());
+    });
+
+    this.aodProcess.on('exit', (code) => {
+      console.log(`[AOD-Net] Daemon exited (code ${code}) — restarting in 2s...`);
+      this.aodProcess = null;
+      // Fail any pending requests so callers can fall back
+      const pending = this._aodResolvers;
+      this._aodResolvers = [];
+      pending.forEach(r => r(null));
+      setTimeout(() => this._spawnAODDaemon(), 2000);
+    });
+
+    this.aodProcess.on('error', (err) => {
+      console.error('[AOD-Net] Daemon error:', err.message);
+    });
+
+    // Kick stdin so the daemon's line-based read loop is ready
+    try {
+      this.aodProcess.stdin.write('\n');
+    } catch (_) { /* ignore */ }
+  }
+
+  // --------------------------------------------
+  // Public API
+  // --------------------------------------------
+  async processFrame(frameBase64, requestedMode) {
+    const clean = (frameBase64 || '').replace(/^data:image\/[a-z]+;base64,/, '');
+    const useCloud = (requestedMode === 'cloud') && this.colabUrl && (this.mode === 'cloud');
+
+    if (useCloud) {
+      return this._processViaColab(clean);
+    }
+    return this._processViaAOD(clean);
+  }
+
+  // --------------------------------------------
+  // Cloud path (DehazeFormer via Colab HTTPS)
+  // --------------------------------------------
+  async _processViaColab(frameBase64) {
+    const t0 = Date.now();
+    try {
+      const data = await postJSON(`${this.colabUrl}/dehaze`, { frame: frameBase64 }, 15000);
+      const rtt = Date.now() - t0;
+
+      if (rtt >= this.SLOW_THRESHOLD_MS) {
+        this.consecutiveSlowFrames++;
+        this.consecutiveFastFrames = 0;
+        console.log(`[AIService] Cloud slow: ${rtt}ms (${this.consecutiveSlowFrames}/${this.SLOW_COUNT_LIMIT})`);
+        if (this.consecutiveSlowFrames >= this.SLOW_COUNT_LIMIT) {
+          this._switchTo('local', `RTT ${rtt}ms exceeded threshold`);
+        }
+      } else {
+        this.consecutiveSlowFrames = 0;
+      }
+
+      if (!data || !data.dehazed) {
+        return { frame: frameBase64, mode: 'cloud_fallback', ms: rtt, error: 'no dehazed field' };
+      }
+
+      return { frame: data.dehazed, mode: 'cloud', ms: rtt };
+
+    } catch (err) {
+      const rtt = Date.now() - t0;
+      const isDisconnect =
+        err.name === 'AbortError' ||
+        err.code === 'ENOTFOUND' ||
+        err.code === 'ECONNREFUSED' ||
+        err.code === 'ECONNRESET' ||
+        (err.message || '').toLowerCase().includes('fetch') ||
+        (err.message || '').toLowerCase().includes('network');
+
+      if (isDisconnect) {
+        this._switchTo('local', `Network/transport error: ${err.message}`);
+      }
+
+      return { frame: frameBase64, mode: 'cloud_fallback', ms: rtt, error: err.message };
+    }
+  }
+
+  // --------------------------------------------
+  // Local path (AOD-Net stdin/stdout daemon)
+  // --------------------------------------------
+  _processViaAOD(frameBase64) {
+    const t0 = Date.now();
+    return new Promise((resolve) => {
+      if (!this.aodProcess || this.aodProcess.exitCode !== null) {
+        return resolve({ frame: frameBase64, mode: 'local_unavailable', ms: Date.now() - t0 });
+      }
+
+      let settled = false;
+      const resolver = (result) => {
+        if (settled) return;
+        settled = true;
+        const rtt = Date.now() - t0;
+
+        // Fire-and-forget recovery probe when running in local mode
+        if (this.mode === 'local' && this.colabUrl && !this._recoveryInFlight) {
+          this._checkColabRecovery();
+        }
+
+        if (result == null) {
+          resolve({ frame: frameBase64, mode: 'local_unavailable', ms: rtt });
+        } else {
+          resolve({ frame: result, mode: 'local', ms: rtt });
+        }
+      };
+
+      this._aodResolvers.push(resolver);
+
+      try {
+        this.aodProcess.stdin.write(frameBase64 + '\n');
+      } catch (err) {
+        const idx = this._aodResolvers.indexOf(resolver);
+        if (idx !== -1) this._aodResolvers.splice(idx, 1);
+        settled = true;
+        console.error('[AOD-Net] stdin write failed:', err.message);
+        resolve({ frame: frameBase64, mode: 'local_unavailable', ms: Date.now() - t0, error: err.message });
+      }
+
+      // Safety: never let a stuck daemon hang the pipeline
+      setTimeout(() => {
+        if (settled) return;
+        const idx = this._aodResolvers.indexOf(resolver);
+        if (idx !== -1) this._aodResolvers.splice(idx, 1);
+        settled = true;
+        console.warn('[AOD-Net] timeout — returning original frame');
+        resolve({ frame: frameBase64, mode: 'local_timeout', ms: Date.now() - t0 });
+      }, 5000);
+    });
+  }
+
+  // --------------------------------------------
+  // Colab recovery probe (background, non-blocking)
+  // --------------------------------------------
+  async _checkColabRecovery() {
+    if (!this.colabUrl) return;
+    this._recoveryInFlight = true;
+    const t0 = Date.now();
+    try {
+      await getJSON(`${this.colabUrl}/health`, 3000);
+      const rtt = Date.now() - t0;
+      if (rtt < this.FAST_THRESHOLD_MS) {
+        this.consecutiveFastFrames++;
+        if (this.consecutiveFastFrames >= this.FAST_COUNT_LIMIT) {
+          this._switchTo('cloud', `Colab recovered (RTT ${rtt}ms)`);
+        }
+      } else {
+        this.consecutiveFastFrames = 0;
+      }
+    } catch (_) {
+      this.consecutiveFastFrames = 0;
+    } finally {
+      this._recoveryInFlight = false;
+    }
+  }
+
+  // --------------------------------------------
+  // Mode switch (emits event for WebSocket broadcast)
+  // --------------------------------------------
+  _switchTo(mode, reason) {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    this.consecutiveSlowFrames = 0;
+    this.consecutiveFastFrames = 0;
+    console.log(`[AIService] Switched to ${mode.toUpperCase()}: ${reason}`);
+    this.emit('modeSwitch', { mode, reason });
+  }
 }
+
+// ============================================
+// SINGLETON EXPORT
+// ============================================
+const instance = new AIService();
+
+// Legacy API: keep `processFrame(frame, mode)` callable as before
+// (websocketService already consumes it that way). It now returns the rich
+// object { frame, mode, ms, error? } — callers that expect a string should
+// migrate, but we also expose the raw string via a .frame accessor.
+module.exports = instance;
+module.exports.processFrame = instance.processFrame.bind(instance);
