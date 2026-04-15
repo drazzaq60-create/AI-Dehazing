@@ -1,3 +1,17 @@
+/**
+ * AI Service — Routes frames to either Google Colab (DehazeFormer, GPU, cloud)
+ * or a local AOD-Net Python daemon (CPU), with automatic RTT-based toggling.
+ *
+ * Toggle rules (from INTEGRATION_GUIDE):
+ *   - RTT < 7s and cloud responding    -> stay on cloud (DehazeFormer)
+ *   - RTT >= 7s for 3 consecutive       -> switch to local (AOD-Net)
+ *   - Network error / Colab unreachable -> instant switch to local
+ *   - Cloud RTT < 3s for 5 consecutive  -> switch back to cloud
+ *
+ * This module is an EventEmitter — websocketService listens for 'modeSwitch'
+ * events and broadcasts them to connected app clients.
+ */
+
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
@@ -5,343 +19,332 @@ const http = require('http');
 const https = require('https');
 const EventEmitter = require('events');
 
-// ============================================
-// CONFIGURATION
-// ============================================
-
-const PYTHON_CMD = os.platform() === 'win32' ? 'python' : 'python3';
-
-// Local AOD-Net fallback daemon (CPU, always available)
-const AODNET_SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'aod_net.py');
-// Weights path — guide §4 specifies `scripts/real_dehaze/aodnet_best` (directory form).
-const AODNET_WEIGHTS = path.join(__dirname, '..', '..', '..', 'scripts', 'real_dehaze', 'aodnet_best');
-
-// ============================================
-// HTTP POST HELPER (with timeout + abort)
-// ============================================
-function postJSON(url, body, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const lib = urlObj.protocol === 'https:' ? https : http;
-    const data = JSON.stringify(body);
-
-    const req = lib.request({
-      hostname: urlObj.hostname,
-      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-      path: urlObj.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        'ngrok-skip-browser-warning': 'true'
-      },
-      timeout: timeoutMs
-    }, (res) => {
-      let responseBody = '';
-      res.on('data', chunk => responseBody += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(responseBody));
-        } catch (e) {
-          const err = new Error(`Invalid JSON from Colab: ${responseBody.slice(0, 200)}`);
-          err.name = 'InvalidJSONError';
-          reject(err);
-        }
-      });
-    });
-
-    req.on('error', (err) => reject(err));
-    req.on('timeout', () => {
-      req.destroy();
-      const err = new Error('Colab request timed out');
-      err.name = 'AbortError';
-      reject(err);
-    });
-
-    req.write(data);
-    req.end();
-  });
-}
-
-function getJSON(url, timeoutMs = 3000) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const lib = urlObj.protocol === 'https:' ? https : http;
-
-    const req = lib.request({
-      hostname: urlObj.hostname,
-      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-      path: urlObj.pathname,
-      method: 'GET',
-      headers: { 'ngrok-skip-browser-warning': 'true' },
-      timeout: timeoutMs
-    }, (res) => {
-      let responseBody = '';
-      res.on('data', chunk => responseBody += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: responseBody }));
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      const err = new Error('Health check timed out');
-      err.name = 'AbortError';
-      reject(err);
-    });
-    req.end();
-  });
-}
-
-// ============================================
-// AIService — EventEmitter with auto-toggle logic
-// ============================================
 class AIService extends EventEmitter {
   constructor() {
     super();
 
-    this.mode = 'cloud';              // 'cloud' | 'local'
+    // Current active mode — starts at cloud if COLAB_URL is set, else local
+    this.colabUrl = (process.env.COLAB_URL || '').replace(/\/+$/, '');
+    this.mode = this.colabUrl ? 'cloud' : 'local';
+
+    // RTT-based toggling state
     this.consecutiveSlowFrames = 0;
     this.consecutiveFastFrames = 0;
+    this.SLOW_THRESHOLD_MS = 7000; // switch to local if RTT >= this
+    this.FAST_THRESHOLD_MS = 3000; // switch back to cloud if RTT < this
+    this.SLOW_COUNT_LIMIT = 3;     // slow frames before switching to local
+    this.FAST_COUNT_LIMIT = 5;     // fast health checks before switching back
 
-    this.SLOW_THRESHOLD_MS = 7000;
-    this.FAST_THRESHOLD_MS = 3000;
-    this.SLOW_COUNT_LIMIT = 3;
-    this.FAST_COUNT_LIMIT = 5;
-
-    this.colabUrl = (process.env.COLAB_URL || '').replace(/\/+$/, '') || null;
-
-    // AOD daemon plumbing (queue-based stdout parsing preserved from legacy impl)
+    // Local AOD-Net daemon (spawned via Python child process)
     this.aodProcess = null;
-    this._aodResolvers = [];
-    this._aodStdoutBuffer = '';
-    this._recoveryInFlight = false;
-
+    this.aodReady = false;
+    this.aodResolvers = [];
+    this.aodBuffer = '';
     this._spawnAODDaemon();
+
+    // Recovery health-check timer (only active when in local mode)
+    this.recoveryTimer = null;
+
     this._logStartup();
   }
 
-  _logStartup() {
-    console.log('='.repeat(50));
-    if (this.colabUrl) {
-      console.log(`[AIService] Cloud: Colab @ ${this.colabUrl}`);
-    } else {
-      console.log('[AIService] Cloud: disabled (COLAB_URL empty) — local AOD-Net only');
-      this.mode = 'local';
-    }
-    console.log(`[AIService] Local: AOD-Net daemon (${AODNET_SCRIPT})`);
-    console.log('='.repeat(50));
-  }
+  // ============================================
+  // LOCAL AOD-NET DAEMON MANAGEMENT
+  // ============================================
 
-  // --------------------------------------------
-  // AOD-Net daemon lifecycle
-  // --------------------------------------------
   _spawnAODDaemon() {
-    if (this.aodProcess) return;
+    const pythonCmd = os.platform() === 'win32' ? 'python' : 'python3';
+    const projectRoot = path.resolve(__dirname, '..', '..', '..');
+    const scriptPath = path.join(projectRoot, 'scripts', 'aod_net.py');
+    const weightsPath = path.join(projectRoot, 'scripts', 'aodnet_finetuned_best.pth');
+
+    console.log(`[AOD-Net] Spawning daemon: ${pythonCmd} ${scriptPath}`);
 
     try {
-      this.aodProcess = spawn(PYTHON_CMD, [
-        '-u',
-        AODNET_SCRIPT,
-        '--weights', AODNET_WEIGHTS
-      ], { stdio: ['pipe', 'pipe', 'pipe'] });
+      this.aodProcess = spawn(pythonCmd, ['-u', scriptPath, '--weights', weightsPath], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      this.aodProcess.stdout.on('data', (data) => {
+        this.aodBuffer += data.toString();
+        const lines = this.aodBuffer.split('\n');
+        this.aodBuffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const resolver = this.aodResolvers.shift();
+          if (resolver) resolver(trimmed);
+        }
+      });
+
+      this.aodProcess.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        console.log('[AOD-Net]', msg);
+        if (msg.includes('Ready')) this.aodReady = true;
+      });
+
+      this.aodProcess.on('exit', (code) => {
+        console.warn(`[AOD-Net] Daemon exited with code ${code} — restarting in 2s...`);
+        this.aodReady = false;
+        this.aodProcess = null;
+        // Fail pending requests
+        const pending = this.aodResolvers;
+        this.aodResolvers = [];
+        pending.forEach(r => r(null));
+        // Auto-restart
+        setTimeout(() => this._spawnAODDaemon(), 2000);
+      });
+
+      this.aodProcess.on('error', (err) => {
+        console.error('[AOD-Net] Failed to start:', err.message);
+        this.aodReady = false;
+      });
     } catch (err) {
-      console.error('[AOD-Net] Failed to spawn:', err.message);
-      this.aodProcess = null;
-      return;
+      console.error('[AOD-Net] spawn failed:', err.message);
     }
-
-    this.aodProcess.stdout.on('data', (data) => {
-      this._aodStdoutBuffer += data.toString();
-      const lines = this._aodStdoutBuffer.split('\n');
-      this._aodStdoutBuffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const resolver = this._aodResolvers.shift();
-        if (resolver) resolver(trimmed);
-      }
-    });
-
-    this.aodProcess.stderr.on('data', (d) => {
-      console.log('[AOD-Net]', d.toString().trim());
-    });
-
-    this.aodProcess.on('exit', (code) => {
-      console.log(`[AOD-Net] Daemon exited (code ${code}) — restarting in 2s...`);
-      this.aodProcess = null;
-      // Fail any pending requests so callers can fall back
-      const pending = this._aodResolvers;
-      this._aodResolvers = [];
-      pending.forEach(r => r(null));
-      setTimeout(() => this._spawnAODDaemon(), 2000);
-    });
-
-    this.aodProcess.on('error', (err) => {
-      console.error('[AOD-Net] Daemon error:', err.message);
-    });
-
-    // Kick stdin so the daemon's line-based read loop is ready
-    try {
-      this.aodProcess.stdin.write('\n');
-    } catch (_) { /* ignore */ }
   }
 
-  // --------------------------------------------
-  // Public API
-  // --------------------------------------------
+  // ============================================
+  // CLOUD (COLAB) HTTP CLIENT
+  // ============================================
+
+  _postJSON(url, body, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url);
+      const lib = urlObj.protocol === 'https:' ? https : http;
+      const data = JSON.stringify(body);
+
+      const req = lib.request({
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+        path: urlObj.pathname + (urlObj.search || ''),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          // ngrok free tier shows an interstitial HTML page without this header
+          'ngrok-skip-browser-warning': 'true'
+        },
+        timeout: timeoutMs
+      }, (res) => {
+        let responseBody = '';
+        res.on('data', chunk => responseBody += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(responseBody));
+          } catch (e) {
+            reject(new Error(`Invalid JSON from Colab: ${responseBody.slice(0, 200)}`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error(`Colab request timed out (${timeoutMs}ms)`));
+      });
+
+      req.write(data);
+      req.end();
+    });
+  }
+
+  _getJSON(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url);
+      const lib = urlObj.protocol === 'https:' ? https : http;
+
+      const req = lib.get({
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+        path: urlObj.pathname + (urlObj.search || ''),
+        headers: { 'ngrok-skip-browser-warning': 'true' },
+        timeout: timeoutMs
+      }, (res) => {
+        let body = '';
+        res.on('data', chunk => body += chunk);
+        res.on('end', () => {
+          try { resolve(JSON.parse(body)); }
+          catch (e) { reject(new Error('Invalid JSON from Colab')); }
+        });
+      });
+
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    });
+  }
+
+  // ============================================
+  // FRAME PROCESSING
+  // ============================================
+
+  /**
+   * Process a single base64-encoded frame.
+   * Returns { frame, mode, ms } where mode is the mode that actually processed it.
+   */
   async processFrame(frameBase64, requestedMode) {
-    const clean = (frameBase64 || '').replace(/^data:image\/[a-z]+;base64,/, '');
-    const useCloud = (requestedMode === 'cloud') && this.colabUrl && (this.mode === 'cloud');
+    const cleanBase64 = frameBase64.replace(/^data:image\/[a-z]+;base64,/, '');
 
-    if (useCloud) {
-      return this._processViaColab(clean);
+    // Decide which backend to use:
+    //   - User explicitly requested a mode AND that mode is currently healthy
+    //   - Otherwise, use whatever the auto-toggle has settled on (this.mode)
+    const effectiveMode = requestedMode === 'local'
+      ? 'local'
+      : (this.mode === 'cloud' && this.colabUrl ? 'cloud' : 'local');
+
+    if (effectiveMode === 'cloud') {
+      return this._processViaColab(cleanBase64, frameBase64);
     }
-    return this._processViaAOD(clean);
+    return this._processViaAOD(cleanBase64, frameBase64);
   }
 
-  // --------------------------------------------
-  // Cloud path (DehazeFormer via Colab HTTPS)
-  // --------------------------------------------
-  async _processViaColab(frameBase64) {
+  async _processViaColab(cleanBase64, originalFrame) {
     const t0 = Date.now();
     try {
-      const data = await postJSON(`${this.colabUrl}/dehaze`, { frame: frameBase64 }, 15000);
+      const data = await this._postJSON(
+        `${this.colabUrl}/dehaze`,
+        { frame: cleanBase64 },
+        15000
+      );
       const rtt = Date.now() - t0;
 
-      if (rtt >= this.SLOW_THRESHOLD_MS) {
-        this.consecutiveSlowFrames++;
-        this.consecutiveFastFrames = 0;
-        console.log(`[AIService] Cloud slow: ${rtt}ms (${this.consecutiveSlowFrames}/${this.SLOW_COUNT_LIMIT})`);
-        if (this.consecutiveSlowFrames >= this.SLOW_COUNT_LIMIT) {
-          this._switchTo('local', `RTT ${rtt}ms exceeded threshold`);
+      if (data && data.dehazed) {
+        // Track slow vs fast frames for toggling
+        if (rtt >= this.SLOW_THRESHOLD_MS) {
+          this.consecutiveSlowFrames++;
+          this.consecutiveFastFrames = 0;
+          console.log(`[Cloud] SLOW frame: ${rtt}ms (${this.consecutiveSlowFrames}/${this.SLOW_COUNT_LIMIT})`);
+          if (this.consecutiveSlowFrames >= this.SLOW_COUNT_LIMIT) {
+            this._switchTo('local', `Cloud RTT ${rtt}ms exceeded ${this.SLOW_THRESHOLD_MS}ms threshold`);
+          }
+        } else {
+          this.consecutiveSlowFrames = 0;
         }
-      } else {
-        this.consecutiveSlowFrames = 0;
+        return { frame: data.dehazed, mode: 'cloud', ms: rtt };
       }
 
-      if (!data || !data.dehazed) {
-        return { frame: frameBase64, mode: 'cloud_fallback', ms: rtt, error: 'no dehazed field' };
-      }
-
-      return { frame: data.dehazed, mode: 'cloud', ms: rtt };
+      // Empty/bad response — treat as failure and fall back to local
+      console.warn('[Cloud] empty response, falling back to local');
+      return this._fallbackToLocal(cleanBase64, originalFrame, 'Cloud returned empty response');
 
     } catch (err) {
-      const rtt = Date.now() - t0;
-      const isDisconnect =
-        err.name === 'AbortError' ||
-        err.code === 'ENOTFOUND' ||
-        err.code === 'ECONNREFUSED' ||
-        err.code === 'ECONNRESET' ||
-        (err.message || '').toLowerCase().includes('fetch') ||
-        (err.message || '').toLowerCase().includes('network');
-
-      if (isDisconnect) {
-        this._switchTo('local', `Network/transport error: ${err.message}`);
+      const isNetworkErr = /timed out|fetch|ECONNREFUSED|ENOTFOUND|ECONNRESET|EAI_AGAIN/i.test(err.message);
+      console.error(`[Cloud] error: ${err.message}`);
+      if (isNetworkErr) {
+        this._switchTo('local', `Network error: ${err.message}`);
       }
-
-      return { frame: frameBase64, mode: 'cloud_fallback', ms: rtt, error: err.message };
+      // Fall back to local for this frame so the user never sees a blank screen
+      return this._fallbackToLocal(cleanBase64, originalFrame, err.message);
     }
   }
 
-  // --------------------------------------------
-  // Local path (AOD-Net stdin/stdout daemon)
-  // --------------------------------------------
-  _processViaAOD(frameBase64) {
+  async _fallbackToLocal(cleanBase64, originalFrame, reason) {
+    // Try local AOD-Net immediately; if that also fails, return the original frame
+    try {
+      const local = await this._processViaAOD(cleanBase64, originalFrame);
+      return { ...local, mode: 'cloud_fallback', fallbackReason: reason };
+    } catch (_) {
+      return { frame: originalFrame, mode: 'cloud_fallback', fallbackReason: reason, ms: 0 };
+    }
+  }
+
+  _processViaAOD(cleanBase64, originalFrame) {
     const t0 = Date.now();
     return new Promise((resolve) => {
-      if (!this.aodProcess || this.aodProcess.exitCode !== null) {
-        return resolve({ frame: frameBase64, mode: 'local_unavailable', ms: Date.now() - t0 });
+      if (!this.aodProcess || this.aodProcess.exitCode !== null || !this.aodReady) {
+        console.warn('[AOD-Net] daemon not ready, returning original frame');
+        return resolve({ frame: originalFrame, mode: 'local_unavailable', ms: 0 });
       }
 
-      let settled = false;
       const resolver = (result) => {
-        if (settled) return;
-        settled = true;
         const rtt = Date.now() - t0;
-
-        // Fire-and-forget recovery probe when running in local mode
-        if (this.mode === 'local' && this.colabUrl && !this._recoveryInFlight) {
+        // If we're currently in local mode, check if cloud has recovered
+        if (this.mode === 'local' && this.colabUrl) {
           this._checkColabRecovery();
         }
-
-        if (result == null) {
-          resolve({ frame: frameBase64, mode: 'local_unavailable', ms: rtt });
-        } else {
-          resolve({ frame: result, mode: 'local', ms: rtt });
-        }
+        resolve({ frame: result || originalFrame, mode: 'local', ms: rtt });
       };
-
-      this._aodResolvers.push(resolver);
+      this.aodResolvers.push(resolver);
 
       try {
-        this.aodProcess.stdin.write(frameBase64 + '\n');
+        this.aodProcess.stdin.write(cleanBase64 + '\n');
       } catch (err) {
-        const idx = this._aodResolvers.indexOf(resolver);
-        if (idx !== -1) this._aodResolvers.splice(idx, 1);
-        settled = true;
-        console.error('[AOD-Net] stdin write failed:', err.message);
-        resolve({ frame: frameBase64, mode: 'local_unavailable', ms: Date.now() - t0, error: err.message });
+        console.error('[AOD-Net] write failed:', err.message);
+        const idx = this.aodResolvers.indexOf(resolver);
+        if (idx !== -1) this.aodResolvers.splice(idx, 1);
+        resolve({ frame: originalFrame, mode: 'local_error', ms: 0 });
       }
 
-      // Safety: never let a stuck daemon hang the pipeline
+      // Safety timeout — if daemon hangs, return original after 5s
       setTimeout(() => {
-        if (settled) return;
-        const idx = this._aodResolvers.indexOf(resolver);
-        if (idx !== -1) this._aodResolvers.splice(idx, 1);
-        settled = true;
-        console.warn('[AOD-Net] timeout — returning original frame');
-        resolve({ frame: frameBase64, mode: 'local_timeout', ms: Date.now() - t0 });
+        const idx = this.aodResolvers.indexOf(resolver);
+        if (idx !== -1) {
+          this.aodResolvers.splice(idx, 1);
+          console.warn('[AOD-Net] timeout, returning original frame');
+          resolve({ frame: originalFrame, mode: 'local_timeout', ms: 5000 });
+        }
       }, 5000);
     });
   }
 
-  // --------------------------------------------
-  // Colab recovery probe (background, non-blocking)
-  // --------------------------------------------
-  async _checkColabRecovery() {
-    if (!this.colabUrl) return;
-    this._recoveryInFlight = true;
-    const t0 = Date.now();
-    try {
-      await getJSON(`${this.colabUrl}/health`, 3000);
-      const rtt = Date.now() - t0;
-      if (rtt < this.FAST_THRESHOLD_MS) {
-        this.consecutiveFastFrames++;
-        if (this.consecutiveFastFrames >= this.FAST_COUNT_LIMIT) {
-          this._switchTo('cloud', `Colab recovered (RTT ${rtt}ms)`);
-        }
-      } else {
-        this.consecutiveFastFrames = 0;
-      }
-    } catch (_) {
-      this.consecutiveFastFrames = 0;
-    } finally {
-      this._recoveryInFlight = false;
-    }
-  }
+  // ============================================
+  // MODE SWITCHING & RECOVERY
+  // ============================================
 
-  // --------------------------------------------
-  // Mode switch (emits event for WebSocket broadcast)
-  // --------------------------------------------
-  _switchTo(mode, reason) {
-    if (this.mode === mode) return;
-    this.mode = mode;
+  _switchTo(newMode, reason) {
+    if (this.mode === newMode) return;
+    const oldMode = this.mode;
+    this.mode = newMode;
     this.consecutiveSlowFrames = 0;
     this.consecutiveFastFrames = 0;
-    console.log(`[AIService] Switched to ${mode.toUpperCase()}: ${reason}`);
-    this.emit('modeSwitch', { mode, reason });
+    console.log(`[AIService] Mode switch: ${oldMode} -> ${newMode} (${reason})`);
+    this.emit('modeSwitch', { mode: newMode, reason, previousMode: oldMode });
+  }
+
+  _checkColabRecovery() {
+    // Throttle — only check at most once every 2 seconds
+    if (this.recoveryTimer) return;
+    this.recoveryTimer = setTimeout(() => { this.recoveryTimer = null; }, 2000);
+
+    if (!this.colabUrl) return;
+
+    (async () => {
+      try {
+        const t0 = Date.now();
+        await this._getJSON(`${this.colabUrl}/health`, 3000);
+        const rtt = Date.now() - t0;
+        if (rtt < this.FAST_THRESHOLD_MS) {
+          this.consecutiveFastFrames++;
+          if (this.consecutiveFastFrames >= this.FAST_COUNT_LIMIT) {
+            this._switchTo('cloud', `Colab recovered (health RTT ${rtt}ms)`);
+          }
+        } else {
+          this.consecutiveFastFrames = 0;
+        }
+      } catch (_) {
+        this.consecutiveFastFrames = 0;
+      }
+    })();
+  }
+
+  // ============================================
+  // PUBLIC GETTERS
+  // ============================================
+
+  getMode() { return this.mode; }
+  getColabUrl() { return this.colabUrl; }
+
+  _logStartup() {
+    console.log('='.repeat(60));
+    console.log('[AIService] Started');
+    console.log(`[AIService]   Initial mode: ${this.mode}`);
+    console.log(`[AIService]   COLAB_URL:    ${this.colabUrl || '(not set)'}`);
+    console.log(`[AIService]   Auto-toggle:  slow>=${this.SLOW_THRESHOLD_MS}ms x${this.SLOW_COUNT_LIMIT} -> local`);
+    console.log(`[AIService]                 fast<${this.FAST_THRESHOLD_MS}ms x${this.FAST_COUNT_LIMIT} -> cloud`);
+    console.log('='.repeat(60));
   }
 }
 
-// ============================================
-// SINGLETON EXPORT
-// ============================================
-const instance = new AIService();
-
-// Legacy API: keep `processFrame(frame, mode)` callable as before
-// (websocketService already consumes it that way). It now returns the rich
-// object { frame, mode, ms, error? } — callers that expect a string should
-// migrate, but we also expose the raw string via a .frame accessor.
-module.exports = instance;
-module.exports.processFrame = instance.processFrame.bind(instance);
+// Export a singleton so websocketService can subscribe to its events
+module.exports = new AIService();
